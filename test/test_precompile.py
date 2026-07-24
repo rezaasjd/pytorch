@@ -1,18 +1,27 @@
 # Owner(s): ["oncall: pt2"]
+import contextlib
 import copy
+import errno
+import gc
+import inspect
 import io
 import os
 import pickle
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import textwrap
 import unittest
+import weakref
+from unittest import mock
 
 import torch
 import torch.utils._pytree as _pytree
 from torch._dynamo.decorators import mark_dynamic, mark_unbacked
 from torch._precompile import PrecompileError
+from torch.distributed._functional_collectives import AsyncCollectiveTensor
 from torch.testing import make_tensor
 from torch.testing._internal.common_cuda import TEST_CUDA
 from torch.testing._internal.common_device_type import instantiate_device_type_tests
@@ -23,6 +32,70 @@ from torch.testing._internal.common_utils import (
     skipIfTorchDynamo,
     TestCase,
 )
+from torch.testing._internal.two_tensor import TwoTensor
+
+
+class _MisreportedDevice(torch.Tensor):
+    """A wrapper subclass reporting a device that differs from the one holding its bytes.
+
+    torch.load builds exactly this from stock inputs: map_location="cuda" gives a bare
+    "cuda" over a "cuda:0" payload, and map_location={"cuda:0": "cpu"} gives a "cuda:0"
+    wrapper over a "cpu" payload. Both axes have to be decided on the leaf.
+    """
+
+    @staticmethod
+    def __new__(cls, payload, reported):
+        return torch.Tensor._make_wrapper_subclass(
+            cls, payload.shape, dtype=payload.dtype, device=reported
+        )
+
+    def __init__(self, payload, reported):
+        self.payload = payload
+
+    def __tensor_flatten__(self):
+        return ["payload"], None
+
+    @staticmethod
+    def __tensor_unflatten__(inner, ctx, outer_size, outer_stride):
+        payload = inner["payload"]
+        return _MisreportedDevice(payload, payload.device)
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        raise NotImplementedError
+
+
+@contextlib.contextmanager
+def _default_dtype(dtype):
+    previous = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(previous)
+
+
+@contextlib.contextmanager
+def _deterministic(enabled):
+    previous = torch.are_deterministic_algorithms_enabled()
+    torch.use_deterministic_algorithms(enabled)
+    try:
+        yield
+    finally:
+        torch.use_deterministic_algorithms(previous)
+
+
+def _lying_device(device):
+    """A device label differing from `device` in INDEX only."""
+    real = torch.device(device)
+    if real.index is not None:
+        return torch.device(real.type)
+    return torch.device(real.type, 0)
+
+
+def _type_lying_device(device):
+    """A device label differing from `device` in TYPE. Requires no such hardware."""
+    return torch.device("cpu" if torch.device(device).type == "cuda" else "cuda", 0)
 
 
 # A module-level (global) model + a function referencing it, to exercise the
@@ -859,6 +932,13 @@ class TestPrecompile(TestCase):
         # The public location: test_public_bindings.test_correct_module_names also
         # enforces this for every torch.compiler.__all__ member.
         self.assertEqual(torch.compiler.precompile.__module__, "torch.compiler")
+        # export_python is the disk-cached decorator over precompile; it lives
+        # under the same compiler namespace, not as a top-level torch.* verb.
+        self.assertIn("export_python", torch.compiler.__all__)
+        self.assertNotIn("export_python", torch.__all__)
+        self.assertFalse(hasattr(torch, "export_python"))
+        self.assertTrue(callable(torch.compiler.export_python))
+        self.assertEqual(torch.compiler.export_python.__module__, "torch.compiler")
 
     def test_backend_invalid_raises(self):
         a, b = torch.randn(4, 4), torch.randn(4, 4)
@@ -2610,6 +2690,3441 @@ class TestPrecompileNumerics(TestCase):
 
 
 instantiate_device_type_tests(TestPrecompileNumerics, globals())
+
+
+def _pool_of(wrapped):
+    # The donation pool is a lean_forward closure nonlocal; tests need it to drive the
+    # defensive paths (plan desync, an in-flight claim) that no public API can reach.
+    loaded = _artifact_of(wrapped)._loaded
+    return next(
+        cell.cell_contents
+        for cell in loaded.__closure__
+        if type(cell.cell_contents).__name__ == "_BufferDonationPool"
+    )
+
+
+def _artifact_of(wrapped):
+    # The decorator deliberately hands back a plain function with no handle on the
+    # artifact, so reach it through the wrapper's closure. Only tests need this; it is
+    # what lets them assert on load-time decisions like whether the lean entry bound.
+    from torch.compiler._export_python import ExportedPythonArtifact
+
+    return next(
+        cell.cell_contents
+        for cell in wrapped.__closure__
+        if isinstance(cell.cell_contents, ExportedPythonArtifact)
+    )
+
+
+@skipIfTorchDynamo("precompile's make_fx capture is incompatible with dynamo wrapping")
+class TestExportPython(TestCase):
+    # torch.compiler.export_python is the disk-cached decorator over
+    # torch.compiler.precompile: first call writes the emitted, self-contained python,
+    # later calls read and exec it directly. Run device-generically so the inductor
+    # path is exercised on CUDA too.
+
+    def _tmp_path(self, name="artifact.py"):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        return os.path.join(d, name)
+
+    def _library(self, name, kind="DEF"):
+        # _scoped_library's teardown without its block: these tests define an op and
+        # then use it several statements later, and wrapping each body in a with just
+        # to reach the op reads worse than destroying the library at cleanup.
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        return stack.enter_context(torch.library._scoped_library(name, kind))
+
+    def test_eager_write_then_load(self, device):
+        path = self._tmp_path()
+        x = make_tensor((4, 4), device=device, dtype=torch.float32)
+        y = make_tensor((4, 4), device=device, dtype=torch.float32)
+        expected = (x * 2 + y).relu()
+
+        def build():
+            @torch.compiler.export_python(path=path, backend="eager")
+            def run(a, b):
+                return (a * 2 + b).relu()
+
+            return run
+
+        self.assertFalse(os.path.exists(path))
+        self.assertEqual(build()(x, y), expected)
+        self.assertTrue(os.path.exists(path))
+        with open(path, encoding="utf-8") as f:
+            self.assertIn("def forward(", f.read())
+
+        # A fresh decorator over the same path loads the emitted source from disk
+        # rather than recompiling.
+        with self.assertLogs("torch.compiler._export_python", level="WARNING") as cm:
+            self.assertEqual(build()(x, y), expected)
+        self.assertIn("about to EXEC", "\n".join(cm.output))
+
+    def test_inductor_writes_output_code(self, device):
+        path = self._tmp_path("inductor.py")
+        m = torch.nn.Sequential(torch.nn.Linear(4, 3)).to(device).eval()
+        x = make_tensor((5, 4), device=device, dtype=torch.float32)
+
+        @torch.compiler.export_python(path=path, backend="inductor")
+        def run(model, inp):
+            return model(inp)
+
+        self.assertEqual(run(m, x), m(x))
+        with open(path, encoding="utf-8") as f:
+            self.assertIn("Inductor output code", f.read())
+        # export_python writes only the self-contained source; there is no cache.
+        self.assertFalse(os.path.exists(path + ".cache"))
+
+    def test_inductor_reload_from_disk(self, device):
+        # Inductor analogue of test_eager_write_then_load: the first build() lowers
+        # through Inductor and commits the emitted source; a SECOND fresh decorator over
+        # the SAME path must load that source from disk and run it instead of
+        # recompiling, exercising the inductor load-from-disk path.
+        path = self._tmp_path("inductor_reload.py")
+        m = torch.nn.Sequential(torch.nn.Linear(4, 3)).to(device).eval()
+        x = make_tensor((5, 4), device=device, dtype=torch.float32)
+        expected = m(x)
+
+        def build():
+            @torch.compiler.export_python(path=path, backend="inductor")
+            def run(model, inp):
+                return model(inp)
+
+            return run
+
+        self.assertEqual(build()(m, x), expected)
+        self.assertTrue(os.path.exists(path))
+        self.assertEqual(build()(m, x), expected)
+
+    def test_inductor_edited_source_takes_effect(self, device):
+        # Inductor hill-climb (ejectable compilation): the emitted source is the source
+        # of truth, so an edit that CHANGES THE MATH must take effect on the next load.
+        # A comment-only edit cannot show that, since it is exec-inert either way.
+        path = self._tmp_path("inductor_edit.py")
+        m = torch.nn.Sequential(torch.nn.Linear(4, 3)).to(device).eval()
+        x = make_tensor((5, 4), device=device, dtype=torch.float32)
+        expected = m(x)
+
+        @torch.compiler.export_python(path=path, backend="inductor")
+        def run(model, inp):
+            return model(inp)
+
+        self.assertEqual(run(m, x), expected)
+
+        # Wrap the artifact's own entry point so the edit is backend-agnostic: whatever
+        # forward() computes, the edited file must return twice it.
+        with open(path, encoding="utf-8") as f:
+            code = f.read()
+        code = code.replace("def forward(", "def _orig_forward(", 1)
+        code += textwrap.dedent(
+            """
+
+            def forward(*args, **kwargs):
+                return _orig_forward(*args, **kwargs) * 2
+            """
+        )
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(code)
+
+        @torch.compiler.export_python(path=path, backend="inductor")
+        def run2(model, inp):
+            return model(inp)
+
+        self.assertEqual(run2(m, x), expected * 2)
+
+    def test_creates_parent_dirs(self, device):
+        path = self._tmp_path(os.path.join("nested", "deep", "artifact.py"))
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+
+        @torch.compiler.export_python(path=path, backend="eager")
+        def run(inp):
+            return inp * 2
+
+        self.assertEqual(run(x), x * 2)
+        self.assertTrue(os.path.exists(path))
+
+    def test_example_inputs_drives_capture(self, device):
+        @torch.compiler.export_python(
+            path=self._tmp_path("ex.py"),
+            backend="eager",
+            example_inputs=[make_tensor((3, 3), device=device, dtype=torch.float32)],
+        )
+        def run(inp):
+            return inp.relu()
+
+        # Capture is specialized to the (3, 3) example, so a (5, 5) runtime input is
+        # rejected -- proving example_inputs, not the call args, drove capture.
+        with self.assertRaisesRegex(PrecompileError, "shape"):
+            run(make_tensor((5, 5), device=device, dtype=torch.float32))
+
+    def test_non_deepcopyable_first_call_arg_errors(self, device):
+        # A non-leaf tensor cannot be deep-copied; the None example_inputs path must
+        # surface a clear error pointing at example_inputs, not a raw deepcopy error.
+        @torch.compiler.export_python(path=self._tmp_path("nc.py"), backend="eager")
+        def run(inp):
+            return inp + 1
+
+        non_leaf = make_tensor(
+            (4,), device=device, dtype=torch.float32
+        ).requires_grad_()
+        with self.assertRaisesRegex(PrecompileError, "example_inputs"):
+            run(non_leaf * 2)
+
+    def test_no_cache_sidecar_written(self, device):
+        # export_python is cache-free: the first run commits only the self-contained
+        # .py, never a .cache sidecar, and a fresh decorator reloads from the .py alone.
+        path = self._tmp_path()
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+
+        def build():
+            @torch.compiler.export_python(path=path, backend="eager")
+            def run(inp):
+                return inp.sin()
+
+            return run
+
+        self.assertEqual(build()(x), x.sin())
+        self.assertFalse(os.path.exists(path + ".cache"))
+        self.assertEqual(build()(x), x.sin())
+
+    @parametrize("backend", ("eager", "inductor"))
+    def test_first_call_preserves_rng_state(self, device, backend):
+        x = torch.empty((4,), device=device)
+        path = self._tmp_path(f"rng_{backend}.py")
+
+        def build():
+            @torch.compiler.export_python(path=path, backend=backend)
+            def run(inp):
+                return torch.rand_like(inp)
+
+            return run
+
+        def rng_state():
+            cpu = torch.random.get_rng_state()
+            if torch.device(device).type == "cpu":
+                return cpu, None
+            module = torch.get_device_module(torch.device(device).type)
+            return cpu, module.get_rng_state(torch.device(device))
+
+        torch.manual_seed(1234)
+        first = build()(x)
+        first_state = rng_state()
+
+        torch.manual_seed(1234)
+        loaded = build()(x)
+        loaded_state = rng_state()
+        self.assertEqual(first, loaded)
+        self.assertEqual(first_state, loaded_state)
+
+    def test_first_call_preserves_noncurrent_cuda_rng_state(self, device):
+        if not TEST_CUDA or torch.cuda.device_count() < 2:
+            self.skipTest("requires two CUDA devices")
+        path = self._tmp_path("rng_noncurrent.py")
+
+        def build():
+            @torch.compiler.export_python(path=path, backend="eager")
+            def run(inp):
+                return torch.rand_like(inp)
+
+            return run
+
+        with torch.cuda.device(0):
+            x = torch.empty(8, device="cuda:1")
+            torch.manual_seed(1234)
+            torch.cuda.manual_seed_all(1234)
+            first = build()(x)
+            first_state = torch.cuda.get_rng_state(1)
+
+            torch.manual_seed(1234)
+            torch.cuda.manual_seed_all(1234)
+            loaded = build()(x)
+            loaded_state = torch.cuda.get_rng_state(1)
+
+        self.assertEqual(first, loaded)
+        self.assertEqual(first_state, loaded_state)
+
+    def _capture_racing_a_concurrent_draw(self, run, x):
+        """Run ``run(x)``'s first capture with a concurrent torch.rand(8) inside it.
+
+        Returns (error_or_None, the concurrently drawn tensor). The capture is stalled
+        on entry so the draw is guaranteed to land between the pre-capture generator
+        snapshot and the post-capture restore decision.
+        """
+        import threading
+        from unittest.mock import patch
+
+        import torch._precompile as precompile_impl
+
+        entered = threading.Event()
+        release = threading.Event()
+        real_capture = precompile_impl._capture
+
+        def synchronized_capture(*args, **kwargs):
+            entered.set()
+            self.assertTrue(release.wait(10))
+            return real_capture(*args, **kwargs)
+
+        errors = []
+
+        def worker():
+            try:
+                run(x)
+            except BaseException as e:
+                errors.append(e)
+
+        with patch.object(precompile_impl, "_capture", synchronized_capture):
+            thread = threading.Thread(target=worker)
+            thread.start()
+            self.assertTrue(entered.wait(10))
+            concurrent = torch.rand(8)
+            release.set()
+            thread.join(20)
+        self.assertFalse(thread.is_alive())
+        return (errors[0] if errors else None), concurrent
+
+    def test_deterministic_capture_ignores_a_concurrent_draw(self, device):
+        # The restore is keyed on whether the CAPTURED GRAPH draws, not on whether
+        # global generator state moved -- otherwise an unrelated thread's draw makes a
+        # deterministic capture look random, and rewinding it would replay that draw.
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+
+        @torch.compiler.export_python(
+            path=self._tmp_path("rng_concurrent.py"), backend="eager"
+        )
+        def run(inp):
+            return inp + 1
+
+        torch.manual_seed(1234)
+        error, concurrent = self._capture_racing_a_concurrent_draw(run, x)
+        self.assertIsNone(error)
+        self.assertNotEqual(torch.rand(8), concurrent)
+
+    def test_random_capture_restores_rng_off_the_main_thread(self, device):
+        # Restoring the generators the capture drew from is what keeps a random fn's
+        # first call faithful, and it is not conditioned on thread identity: the
+        # capturing call and the loading call agree even from a worker thread.
+        import threading
+
+        path = self._tmp_path("rng_worker.py")
+
+        def build():
+            @torch.compiler.export_python(path=path, backend="eager")
+            def run(inp):
+                return torch.rand_like(inp)
+
+            return run
+
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+        results = []
+        errors = []
+
+        def worker():
+            try:
+                out = build()(x)
+                results.append((out, torch.random.get_rng_state()))
+            except BaseException as e:
+                errors.append(e)
+
+        for _ in range(2):
+            torch.manual_seed(1234)
+            thread = threading.Thread(target=worker)
+            thread.start()
+            thread.join(20)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(results[0], results[1])
+
+    def test_explicit_examples_released_after_materialization(self, device):
+        example = make_tensor((4,), device=device, dtype=torch.float32)
+        example_ref = weakref.ref(example)
+
+        @torch.compiler.export_python(
+            path=self._tmp_path("example_lifetime.py"),
+            backend="eager",
+            example_inputs=[example],
+        )
+        def run(inp):
+            return inp + 1
+
+        del example
+        self.assertEqual(
+            run(make_tensor((4,), device=device, dtype=torch.float32)).shape,
+            (4,),
+        )
+        gc.collect()
+        self.assertIsNone(example_ref())
+
+    def test_decompositions_released_after_materialization(self, device):
+        path = self._tmp_path("decomposition_lifetime.py")
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+
+        @torch.compiler.export_python(path=path, backend="eager")
+        def seed(inp):
+            return inp + 1
+
+        self.assertEqual(seed(x), x + 1)
+        payload = make_tensor((4,), device=device, dtype=torch.float32)
+        payload_ref = weakref.ref(payload)
+
+        def make_decomposition(value):
+            def decomposition(inp):
+                return inp + value.sum() * 0
+
+            return decomposition
+
+        decomposition = make_decomposition(payload)
+        table = {torch.ops.aten.sin.default: decomposition}
+
+        @torch.compiler.export_python(path=path, backend="eager", decompositions=table)
+        def loaded(inp):
+            return inp + 1
+
+        self.assertEqual(loaded(x), x + 1)
+        del payload, decomposition, table
+        gc.collect()
+        self.assertIsNone(payload_ref())
+
+    def test_decorated_method_binds_instance(self, device):
+        path = self._tmp_path("method.py")
+
+        class Model(torch.nn.Module):
+            @torch.compiler.export_python(path=path, backend="eager")
+            def run(self, inp):
+                return inp + 1
+
+        model = Model()
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+        self.assertTrue(inspect.ismethod(model.run))
+        self.assertEqual(model.run(x), x + 1)
+
+    def test_module_training_state_is_guarded(self, device):
+        path = self._tmp_path("module_training.py")
+
+        class Model(torch.nn.Module):
+            def forward(self, inp):
+                return inp + 1 if self.training else inp - 1
+
+        model = Model().to(device).train()
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+
+        @torch.compiler.export_python(path=path, backend="eager")
+        def run(mod, inp):
+            return mod(inp)
+
+        self.assertEqual(run(model, x), x + 1)
+        model.eval()
+
+        @torch.compiler.export_python(path=path, backend="eager")
+        def loaded(mod, inp):
+            return mod(inp)
+
+        with self.assertRaisesRegex(PrecompileError, "training state"):
+            loaded(model, x)
+
+    def test_hand_edit_dropping_training_stamp_warns_and_runs(self, device):
+        # The artifact is meant to be hand-edited, so dropping the stamp turns the
+        # guard off with a warning rather than bricking the file -- the same contract
+        # the version stamp already has.
+        path = self._tmp_path("module_training_edit.py")
+
+        class Model(torch.nn.Module):
+            def forward(self, inp):
+                return inp + 1 if self.training else inp - 1
+
+        model = Model().to(device).train()
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+
+        @torch.compiler.export_python(path=path, backend="eager")
+        def run(mod, inp):
+            return mod(inp)
+
+        self.assertEqual(run(model, x), x + 1)
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+        kept = [line for line in lines if "module-training:" not in line]
+        self.assertEqual(len(kept), len(lines) - 1)
+        with open(path, "w", encoding="utf-8") as f:
+            f.writelines(kept)
+        model.eval()
+
+        @torch.compiler.export_python(path=path, backend="eager")
+        def loaded(mod, inp):
+            return mod(inp)
+
+        with self.assertLogs("torch.compiler._export_python", level="WARNING") as logs:
+            self.assertEqual(loaded(model, x), x + 1)
+        self.assertTrue(any("no recorded training state" in m for m in logs.output))
+
+    def test_decorated_function_is_picklable(self, device):
+        name = "_export_python_pickle_fixture"
+
+        def original(inp):
+            return inp + 1
+
+        original.__name__ = name
+        original.__qualname__ = name
+        original.__module__ = __name__
+        wrapped = torch.compiler.export_python(
+            path=self._tmp_path("pickle.py"), backend="eager"
+        )(original)
+        globals()[name] = wrapped
+        try:
+            self.assertIs(pickle.loads(pickle.dumps(wrapped)), wrapped)
+        finally:
+            del globals()[name]
+
+    def test_hill_climb_edited_source_takes_effect(self, device):
+        path = self._tmp_path("edit.py")
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+
+        @torch.compiler.export_python(path=path, backend="eager")
+        def run(inp):
+            return inp + 1
+
+        self.assertEqual(run(x), x + 1)
+
+        with open(path, encoding="utf-8") as f:
+            code = f.read()
+        edited = code.replace(
+            "torch.ops.aten.add.Tensor(flat_1, 1)",
+            "torch.ops.aten.add.Tensor(flat_1, 100)",
+        )
+        self.assertNotEqual(
+            edited, code, "expected the add constant in the emitted graph"
+        )
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(edited)
+
+        # A fresh decorator sees the edited source and always exec's it, so the edited
+        # constant takes effect.
+        @torch.compiler.export_python(path=path, backend="eager")
+        def run2(inp):
+            return inp + 1
+
+        self.assertEqual(run2(x), x + 100)
+
+    def test_first_call_applies_mutation_once(self, device):
+        path = self._tmp_path("bn.py")
+        torch.manual_seed(0)
+        m = torch.nn.BatchNorm1d(4).to(device).train()
+        x = make_tensor((8, 4), device=device, dtype=torch.float32)
+
+        ref = torch.nn.BatchNorm1d(4).to(device).train()
+        ref.load_state_dict(m.state_dict())
+        ref(x)
+
+        @torch.compiler.export_python(path=path, backend="eager")
+        def run(model, inp):
+            return model(inp)
+
+        run(m, x)
+        # Capture deep-copies the args, so the running stats are updated exactly once
+        # (by the artifact), matching a single eager application -- not twice.
+        self.assertEqual(m.running_mean, ref.running_mean)
+        self.assertEqual(m.running_var, ref.running_var)
+
+    @parametrize("backend", ("eager", "inductor"))
+    def test_concurrent_first_calls_precompile_once(self, device, backend):
+        import threading
+        from unittest.mock import patch
+
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+
+        @torch.compiler.export_python(
+            path=self._tmp_path("concurrent.py"), backend=backend
+        )
+        def run(inp):
+            return inp + 1
+
+        real = torch.compiler.precompile
+
+        # Count precompile() invocations; the decorator calls torch.compiler.precompile
+        # exactly once behind its double-checked lock even under the racing first calls.
+        class _Counting:
+            def __init__(self):
+                self.n = 0
+
+            def __call__(self, *a, **k):
+                self.n += 1
+                return real(*a, **k)
+
+        counting = _Counting()
+        n = 8
+        barrier = threading.Barrier(n)
+        results: list = [None] * n
+
+        def worker(i):
+            barrier.wait()
+            results[i] = run(x)
+
+        with patch.object(torch.compiler, "precompile", counting):
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        # The double-checked lock must precompile exactly once despite the race.
+        self.assertEqual(counting.n, 1)
+        for r in results:
+            self.assertEqual(r, x + 1)
+
+    def test_concurrent_distinct_captures_are_serialized(self, device):
+        import threading
+        import time
+        from unittest.mock import patch
+
+        import torch._precompile as precompile_impl
+
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+        runs = []
+        for i in range(4):
+
+            @torch.compiler.export_python(
+                path=self._tmp_path(f"concurrent_{i}.py"), backend="eager"
+            )
+            def run(inp):
+                return inp + 1
+
+            runs.append(run)
+
+        real = precompile_impl._capture
+        state_lock = threading.Lock()
+        active = 0
+        max_active = 0
+
+        def spy(*args, **kwargs):
+            nonlocal active, max_active
+            with state_lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.02)
+                return real(*args, **kwargs)
+            finally:
+                with state_lock:
+                    active -= 1
+
+        barrier = threading.Barrier(len(runs))
+        results: list = [None] * len(runs)
+
+        def worker(i):
+            barrier.wait()
+            results[i] = runs[i](x)
+
+        with patch.object(precompile_impl, "_capture", spy):
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        self.assertEqual(max_active, 1)
+        for result in results:
+            self.assertEqual(result, x + 1)
+
+    def test_export_and_direct_precompile_captures_are_serialized(self, device):
+        import threading
+        import time
+        from unittest.mock import patch
+
+        import torch._precompile as precompile_impl
+
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+
+        @torch.compiler.export_python(
+            path=self._tmp_path("direct_concurrent.py"), backend="eager"
+        )
+        def exported(inp):
+            return inp + 1
+
+        real_capture = precompile_impl._capture
+        state_lock = threading.Lock()
+        active = 0
+        max_active = 0
+
+        def spy(*args, **kwargs):
+            nonlocal active, max_active
+            with state_lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.05)
+                return real_capture(*args, **kwargs)
+            finally:
+                with state_lock:
+                    active -= 1
+
+        barrier = threading.Barrier(2)
+        errors = []
+
+        def export_worker():
+            try:
+                barrier.wait()
+                exported(x)
+            except BaseException as e:
+                errors.append(e)
+
+        def precompile_worker():
+            try:
+                barrier.wait()
+                torch.compiler.precompile(lambda inp: inp + 2, x, backend="eager")
+            except BaseException as e:
+                errors.append(e)
+
+        with patch.object(precompile_impl, "_capture", spy):
+            threads = [
+                threading.Thread(target=export_worker),
+                threading.Thread(target=precompile_worker),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(20)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(max_active, 1)
+
+    def test_nested_first_capture_does_not_deadlock(self, device):
+        code = textwrap.dedent(
+            f"""
+            import os
+            import tempfile
+            import torch
+
+            with tempfile.TemporaryDirectory() as d:
+                example = torch.ones(1, device={device!r})
+
+                @torch.compiler.export_python(
+                    path=os.path.join(d, "inner.py"),
+                    backend="eager",
+                    example_inputs=[example],
+                )
+                def inner(x):
+                    return x + 1
+
+                @torch.compiler.export_python(
+                    path=os.path.join(d, "outer.py"), backend="eager"
+                )
+                def outer(x):
+                    return inner(x) * 2
+
+                torch.testing.assert_close(outer(example), (example + 1) * 2)
+            """
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_same_path_concurrent_publish_has_one_winner(self, device):
+        # Two PROCESSES racing a fresh path is the real scenario (in one process,
+        # materialization is serialized by the capture lock, so the second caller just
+        # finds the file). Both must end up running the winner's artifact, never their
+        # own divergent source, and no temp file may be left beside it.
+        code = textwrap.dedent(
+            f"""
+            import os, sys, torch
+            path, marker, barrier_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+
+            real = torch.compiler.precompile
+            def fake(fn, *args, **kwargs):
+                return "def forward(x):\\n    return x + " + marker + "\\n", b""
+            torch.compiler.precompile = fake
+
+            @torch.compiler.export_python(path=path, backend="eager")
+            def run(inp):
+                return inp
+
+            # Rendezvous so both processes are inside the presence gate together.
+            open(os.path.join(barrier_dir, marker), "w").close()
+            while len(os.listdir(barrier_dir)) < 2:
+                pass
+            print(int(run(torch.zeros(1, device={device!r})).item()))
+            """
+        )
+        path = self._tmp_path("publish.py")
+        barrier_dir = os.path.join(os.path.dirname(path), "barrier")
+        os.makedirs(barrier_dir, exist_ok=True)
+        procs = [
+            subprocess.Popen(
+                [sys.executable, "-c", code, path, marker, barrier_dir],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for marker in ("1", "2")
+        ]
+        outs = []
+        for proc in procs:
+            stdout, stderr = proc.communicate(timeout=180)
+            self.assertEqual(proc.returncode, 0, stderr)
+            outs.append(stdout.strip().splitlines()[-1])
+        # Same answer in both, and it is one of the two candidate artifacts.
+        self.assertEqual(outs[0], outs[1])
+        self.assertIn(outs[0], ("1", "2"))
+        self.assertEqual(
+            sorted(os.listdir(os.path.dirname(path))),
+            sorted(["barrier", os.path.basename(path)]),
+        )
+
+        # A third, later reader gets that same winner off disk.
+        @torch.compiler.export_python(path=path, backend="eager")
+        def fresh(inp):
+            return inp
+
+        self.assertEqual(int(fresh(torch.zeros(1, device=device)).item()), int(outs[0]))
+
+    def test_publish_falls_back_when_filesystem_has_no_hard_links(self, device):
+        from torch.compiler._export_python import _atomic_publish
+
+        path = self._tmp_path("nolink.py")
+        real_link = os.link
+
+        def no_link(src, dst):
+            raise OSError(errno.EPERM, "operation not permitted")
+
+        with mock.patch.object(os, "link", no_link):
+            with self.assertLogs("torch.compiler._export_python", "WARNING") as logs:
+                self.assertTrue(_atomic_publish(path, b"payload"))
+        # Assert on wording only the implementation supplies: the mock's strerror is
+        # interpolated into the same message and would satisfy a looser match.
+        self.assertTrue(any("last-writer-wins" in m for m in logs.output))
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), b"payload")
+        self.assertEqual(os.listdir(os.path.dirname(path)), [os.path.basename(path)])
+        self.assertIs(os.link, real_link)
+
+    def test_publish_does_not_swallow_real_io_errors(self, device):
+        # Only "this filesystem has no hard links" degrades to last-writer-wins; a full
+        # disk must surface rather than silently weaken first-publisher-wins.
+        from torch.compiler._export_python import _atomic_publish
+
+        path = self._tmp_path("enospc.py")
+
+        def full_disk(src, dst):
+            raise OSError(errno.ENOSPC, "no space left on device")
+
+        with mock.patch.object(os, "link", full_disk):
+            with self.assertRaises(OSError):
+                _atomic_publish(path, b"payload")
+        self.assertFalse(os.path.exists(path))
+        self.assertEqual(os.listdir(os.path.dirname(path)), [])
+
+    def test_clobbered_non_artifact_source_raises_clean_error(self, device):
+        # A clobbered non-artifact source degrades to a clean PrecompileError
+        # referencing the path, not a raw KeyError/SyntaxError, so a stale hand-edit
+        # that drops the forward() surfaces an actionable message.
+        path = self._tmp_path("clobber.py")
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+
+        @torch.compiler.export_python(path=path, backend="eager")
+        def run(inp):
+            return inp + 1
+
+        self.assertEqual(run(x), x + 1)
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("x = 1\n")
+
+        @torch.compiler.export_python(path=path, backend="eager")
+        def run2(inp):
+            return inp + 1
+
+        with self.assertRaisesRegex(
+            PrecompileError, "could not be run as precompile source"
+        ):
+            run2(x)
+
+    def test_kwargs_bound_positionally(self, device):
+        path = self._tmp_path("kw.py")
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+
+        @torch.compiler.export_python(path=path, backend="eager")
+        def run(a, b):
+            return a - b
+
+        # A keyword call binds onto (a, b) positionally and runs the artifact.
+        self.assertEqual(run(a=x, b=x + 1), x - (x + 1))
+
+    def test_keyword_only_params_rejected(self, device):
+        @torch.compiler.export_python(path=self._tmp_path("ko.py"), backend="eager")
+        def run(a, *, b):
+            return a + b
+
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+        with self.assertRaisesRegex(TypeError, "keyword-only"):
+            run(x, b=x)
+
+    def test_positional_defaults_are_canonicalized(self, device):
+        default = make_tensor((4,), device=device, dtype=torch.float32)
+
+        @torch.compiler.export_python(path=self._tmp_path("posdef.py"), backend="eager")
+        def run(a, b=default, c=default):
+            return a + b + c
+
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+        other = make_tensor((4,), device=device, dtype=torch.float32)
+        self.assertEqual(run(x, c=other), x + default + other)
+        self.assertEqual(run(x, b=other), x + other + default)
+
+    def test_non_tensor_arguments_rejected(self, device):
+        @torch.compiler.export_python(path=self._tmp_path("scalar.py"), backend="eager")
+        def run(inp, scale=1):
+            return inp * scale
+
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+        with self.assertRaisesRegex(TypeError, "only Tensor pytrees"):
+            run(x, 1)
+
+    def test_var_kwargs_rejected(self, device):
+        # A fn declaring **kwargs cannot be laid out positionally once extra keyword
+        # args are passed; the error must name **kwargs as the cause rather than
+        # misreporting it as a positional-or-keyword arg left to its default.
+        @torch.compiler.export_python(path=self._tmp_path("varkw.py"), backend="eager")
+        def run(a, **kw):
+            return a + kw["b"]
+
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+        with self.assertRaisesRegex(TypeError, r"\*\*kwargs"):
+            run(x, b=x)
+
+    def test_decompositions_forwarded(self, device):
+        from unittest.mock import patch
+
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+        sentinel: dict = {}
+        real = torch.compiler.precompile
+        captured: dict = {}
+
+        def spy(fn, *a, **k):
+            captured["decompositions"] = k.get("decompositions")
+            return real(fn, *a, **k)
+
+        @torch.compiler.export_python(
+            path=self._tmp_path("dec.py"), backend="eager", decompositions=sentinel
+        )
+        def run(inp):
+            return inp + 1
+
+        with patch.object(torch.compiler, "precompile", spy):
+            self.assertEqual(run(x), x + 1)
+        self.assertIs(captured["decompositions"], sentinel)
+
+    def test_existing_artifact_ignores_changed_backend(self, device):
+        # Presence is the sole signal: a new decorator over an existing path loads it
+        # as-is even with a different backend, so the on-disk eager artifact is reused
+        # and NOT re-lowered through inductor.
+        path = self._tmp_path("sole_signal.py")
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+
+        @torch.compiler.export_python(path=path, backend="eager")
+        def run(inp):
+            return inp + 1
+
+        self.assertEqual(run(x), x + 1)
+        with open(path, encoding="utf-8") as f:
+            first = f.read()
+        self.assertNotIn("Inductor output code", first)
+
+        @torch.compiler.export_python(path=path, backend="inductor")
+        def run2(inp):
+            return inp + 1
+
+        self.assertEqual(run2(x), x + 1)
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), first)
+
+    def test_version_skew_warns(self, device):
+        path = self._tmp_path("skew.py")
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+
+        @torch.compiler.export_python(path=path, backend="eager")
+        def run(inp):
+            return inp + 1
+
+        self.assertEqual(run(x), x + 1)
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().split("\n")
+        tag = "# torch.compiler.export_python torch-version: "
+        self.assertTrue(lines[0].startswith(tag))
+        lines[0] = tag + repr("0.0.0-bogus")
+        # Displaced from line 1 on purpose: all four stamps are read from the leading
+        # comment block, so a hand-edit that adds a comment above them must not quietly
+        # disable the one check that catches a stale committed artifact.
+        lines.insert(0, "# a hand-edit above the stamps")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+
+        @torch.compiler.export_python(path=path, backend="eager")
+        def run2(inp):
+            return inp + 1
+
+        # A stamped-but-mismatched artifact warns about the skew but still runs.
+        with self.assertLogs("torch.compiler._export_python", level="WARNING") as cm:
+            self.assertEqual(run2(x), x + 1)
+        self.assertTrue(any("0.0.0-bogus" in m for m in cm.output))
+
+    def test_no_version_warning_when_stamp_absent(self, device):
+        path = self._tmp_path("nostamp.py")
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+
+        @torch.compiler.export_python(path=path, backend="eager")
+        def run(inp):
+            return inp + 1
+
+        self.assertEqual(run(x), x + 1)
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().split("\n")
+        tag = "# torch.compiler.export_python torch-version: "
+        if lines and lines[0].startswith(tag):
+            lines = lines[1:]
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+
+        @torch.compiler.export_python(path=path, backend="eager")
+        def run2(inp):
+            return inp + 1
+
+        # A hand-edit that drops the stamp still gets the executable-file warning, but
+        # must not get a version-skew warning.
+        with self.assertLogs("torch.compiler._export_python", level="WARNING") as cm:
+            self.assertEqual(run2(x), x + 1)
+        self.assertTrue(any("about to EXEC" in message for message in cm.output))
+        self.assertFalse(any("produced by torch" in message for message in cm.output))
+
+    def test_env_import_failure_distinct_message(self, device):
+        # A valid artifact that fails to import a dependency under the current torch
+        # gets a distinct "different torch version or environment" error, not the
+        # clobbered-source message, so version skew is diagnosable.
+        path = self._tmp_path("badimport.py")
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+
+        @torch.compiler.export_python(path=path, backend="eager")
+        def run(inp):
+            return inp + 1
+
+        self.assertEqual(run(x), x + 1)
+        with open(path, encoding="utf-8") as f:
+            code = f.read()
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("import a_module_that_does_not_exist_xyz\n" + code)
+
+        @torch.compiler.export_python(path=path, backend="eager")
+        def run2(inp):
+            return inp + 1
+
+        with self.assertRaisesRegex(PrecompileError, "different torch|environment"):
+            run2(x)
+
+    @parametrize("backend", ["eager", "inductor"])
+    def test_unsafe_reduce_overhead_matches_checked(self, device, backend):
+        # The unsafe entry point must compute exactly what the checked one does; the
+        # only difference is that the driver's invariant guards are gone, which is
+        # asserted below by feeding a shape the artifact was not traced with.
+        x = make_tensor((4, 4), device=device, dtype=torch.float32)
+        y = make_tensor((4, 4), device=device, dtype=torch.float32)
+        expected = ((x * 2 + y).relu(), x - y)
+
+        def build(unsafe):
+            @torch.compiler.export_python(
+                path=self._tmp_path(f"unsafe_{backend}_{unsafe}.py"),
+                backend=backend,
+                unsafe_reduce_overhead=unsafe,
+            )
+            def run(a, b):
+                return (a * 2 + b).relu(), a - b
+
+            return run
+
+        checked, unsafe = build(False), build(True)
+        self.assertEqual(checked(x, y), expected)
+        self.assertEqual(unsafe(x, y), expected)
+
+        # Two distinct tensors: passing one tensor twice would trip the aliasing
+        # guard first and never reach the shape diagnosis this is about.
+        big = make_tensor((8, 8), device=device, dtype=torch.float32)
+        big2 = make_tensor((8, 8), device=device, dtype=torch.float32)
+        with self.assertRaisesRegex(PrecompileError, "specialized to the static dims"):
+            checked(big, big2)
+        # The unsafe entry point never reaches that diagnosis: depending on the backend
+        # it either computes silently (eager) or trips inductor's own stride assert.
+        try:
+            unsafe(big, big2)
+        except Exception as e:
+            self.assertNotIn("specialized to the static dims", str(e))
+
+    def test_unsafe_reduce_overhead_single_output(self, device):
+        # An artifact whose out_spec is a bare leaf must hand back the tensor itself,
+        # not the one-element list the compiled call returns.
+        path = self._tmp_path("unsafe_single.py")
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+
+        @torch.compiler.export_python(
+            path=path, backend="eager", unsafe_reduce_overhead=True
+        )
+        def run(inp):
+            return inp + 1
+
+        out = run(x)
+        self.assertIsInstance(out, torch.Tensor)
+        self.assertEqual(out, x + 1)
+        # The checked forward also returns a bare tensor, so without pinning that the
+        # LEAN entry is bound this passes even when _lean_entry never runs.
+        self.assertTrue(_artifact_of(run)._lean_bound)
+
+    def test_unsafe_reduce_overhead_falls_back_for_module(self, device):
+        # A module argument means the driver is lifting params, not just checking, so
+        # there is nothing safe to strip: warn and keep the checked entry point.
+        path = self._tmp_path("unsafe_module.py")
+        m = torch.nn.Sequential(torch.nn.Linear(4, 3)).to(device).eval()
+        x = make_tensor((5, 4), device=device, dtype=torch.float32)
+
+        @torch.compiler.export_python(
+            path=path, backend="eager", unsafe_reduce_overhead=True
+        )
+        def run(model, inp):
+            return model(inp)
+
+        with self.assertLogs("torch.compiler._export_python", level="WARNING") as cm:
+            self.assertEqual(run(m, x), m(x))
+        self.assertIn("unsafe_reduce_overhead=True had no effect", "\n".join(cm.output))
+
+    def test_unsafe_reduce_overhead_arity_error(self, device):
+        # A miscall gets a real message instead of an unpack error from generated
+        # source. Note this one is raised by signature binding, before the artifact is
+        # reached; test_stale_artifact_arity_mismatch covers the lean check itself.
+        path = self._tmp_path("unsafe_arity.py")
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+
+        @torch.compiler.export_python(
+            path=path, backend="eager", unsafe_reduce_overhead=True
+        )
+        def run(a, b):
+            return a + b
+
+        self.assertEqual(run(x, x), x + x)
+        with self.assertRaisesRegex(TypeError, "missing a required argument"):
+            run(x)
+
+    @parametrize(
+        "flaw",
+        ["shape", "stride", "dtype", "neg", "device"],
+    )
+    def test_out_donor_metadata_guards(self, device, flaw):
+        # Each of these is a memory-corruption guard: the kernel writes through baked
+        # sizes and strides, so a donor that differs in any of them is not a wrong
+        # number but a bad store. Dropping any one clause must fail a test.
+        if flaw == "device" and not (TEST_CUDA and torch.device(device).type == "cpu"):
+            self.skipTest("needs a second device to donate from")
+
+        @torch.compiler.export_python(
+            path=self._tmp_path(f"donor_{flaw}.py"), unsafe_reduce_overhead=True
+        )
+        def run(inp, *, out=None):
+            return inp.sin() + 1
+
+        x = make_tensor((8, 8), device=device, dtype=torch.float32)
+        good = torch.empty_like(run(x))
+        donors = {
+            "stride": lambda: torch.empty(8, 8, device=device).t(),
+            "dtype": lambda: torch.empty(8, 8, device=device, dtype=torch.float64),
+            # Stride MATCHES the expected (8, 1), so only the shape clause can
+            # reject it -- equal numel would not have been enough, since (4, 16) has
+            # stride (16, 1) and would have tripped the stride clause instead.
+            "shape": lambda: torch.empty(64, device=device).as_strided((7, 8), (8, 1)),
+            "neg": lambda: torch.empty(8, 8, device=device)._neg_view(),
+            "device": lambda: torch.empty(8, 8, device="cuda"),
+        }
+        with self.assertRaisesRegex(PrecompileError, "must be a plain Tensor"):
+            run(x, out=(donors[flaw](),))
+        # The good donor still records afterwards, so a rejection is not sticky.
+        self.assertEqual(run(x, out=(good,)), x.sin() + 1)
+
+    def test_out_rotated_donor_metadata_is_rechecked(self, device):
+        # Double-buffering is the obvious usage, so a swapped-in donor gets the full
+        # metadata check rather than being written through the recorded plan blindly.
+        @torch.compiler.export_python(
+            path=self._tmp_path("donor_rotate.py"), unsafe_reduce_overhead=True
+        )
+        def run(inp, *, out=None):
+            return inp.sin() + 1
+
+        x = make_tensor((8, 8), device=device, dtype=torch.float32)
+        expected = x.sin() + 1
+        a = torch.empty_like(expected)
+        b = torch.empty_like(expected)
+        self.assertEqual(run(x, out=(a,)), expected)
+        self.assertEqual(run(x, out=(b,)), expected)  # rotation is allowed
+        self.assertEqual(run(x, out=(a,)), expected)
+        # Wrong dtype at the same shape rather than an undersized buffer: a regression
+        # here must surface as a failed assertion, not an out-of-bounds write that
+        # aborts the interpreter and takes the rest of the suite with it.
+        with self.assertRaisesRegex(PrecompileError, "must be a plain Tensor"):
+            run(x, out=(torch.empty(8, 8, device=device, dtype=torch.float64),))
+
+    def test_plain_call_on_another_thread_is_not_served_the_donor(self, device):
+        # The pool is a per-call recording. A thread that never opted into out= must
+        # never be handed the donating thread's buffers, nor write into its plan.
+        import threading
+
+        @torch.compiler.export_python(
+            path=self._tmp_path("pool_threads.py"), unsafe_reduce_overhead=True
+        )
+        def run(a, b, *, out=None):
+            return (a @ b).relu()
+
+        n = 64
+        a = make_tensor((n, n), device=device, dtype=torch.float32)
+        b = make_tensor((n, n), device=device, dtype=torch.float32)
+        expected = run(a, b).clone()
+        donor = torch.empty_like(expected)
+
+        errors = []
+        stop = threading.Event()
+        started = threading.Event()
+
+        def donating():
+            # The RECORDING call happens here too, so a bystander allocating during it
+            # would be written into the plan -- the worse of the two failure modes.
+            # It also keeps record and replay on one thread, hence one accelerator
+            # stream, which the pool separately requires.
+            try:
+                started.set()
+                for _ in range(50):
+                    run(a, b, out=(donor,))
+            except BaseException as e:
+                errors.append(repr(e))
+            finally:
+                stop.set()
+
+        def plain():
+            # No unittest assertions off the main thread; collect and check below.
+            try:
+                started.wait(30)
+                while not stop.is_set():
+                    got = run(a, b)
+                    if got.data_ptr() == donor.data_ptr():
+                        errors.append("plain call was served the donor tensor")
+                        return
+                    if not torch.equal(got, expected):
+                        errors.append("plain call returned the wrong values")
+                        return
+            except BaseException as e:
+                errors.append(repr(e))
+
+        threads = [threading.Thread(target=donating), threading.Thread(target=plain)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(120)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertFalse(
+            errors, f"concurrent plain/donating calls interfered: {errors}"
+        )
+        self.assertEqual(donor, expected)
+
+    def test_out_rejected_for_dynamic_shape_artifact(self, device):
+        path = self._tmp_path("out_unbacked.py")
+
+        @torch.compiler.export_python(path=path, unsafe_reduce_overhead=True)
+        def run(inp, w, *, out=None):
+            return (inp @ w).relu()
+
+        w = make_tensor((16, 16), device=device, dtype=torch.float32)
+        x = make_tensor((8, 16), device=device, dtype=torch.float32)
+        mark_unbacked(x, 0)
+        expected = run(x, w)
+        with self.assertRaisesRegex(PrecompileError, "dynamic input dimensions"):
+            run(x, w, out=(torch.empty_like(expected),))
+
+    def test_stale_artifact_arity_mismatch_hits_the_lean_check(self, device):
+        # The lean entry's own arity check only fires when a loaded artifact's IN_SPEC
+        # disagrees with the current fn -- i.e. a stale committed artifact whose source
+        # signature has since changed. Signature binding catches everything earlier.
+        path = self._tmp_path("stale_arity.py")
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+
+        @torch.compiler.export_python(
+            path=path, backend="eager", unsafe_reduce_overhead=True
+        )
+        def two(a, b):
+            return a + b
+
+        self.assertEqual(two(x, x), x + x)
+
+        @torch.compiler.export_python(
+            path=path, backend="eager", unsafe_reduce_overhead=True
+        )
+        def three(a, b, c):
+            return a + b + c
+
+        with self.assertRaisesRegex(PrecompileError, "expected 2 positional args"):
+            three(x, x, x)
+
+    def test_lean_entry_grad_matches_checked_for_aliased_output(self, device):
+        # The lean path must not force grad off for an inductor artifact: AOTAutograd's
+        # output-alias epilogue runs outside the inner no_grad and is grad-sensitive, so
+        # forcing it silently strips grad_fn from an output that aliases an input.
+        x = make_tensor((8,), device=device, dtype=torch.float32)
+
+        def fn(a, b):
+            return a + b, a.view(2, 4)
+
+        def grad_of(**kwargs):
+            wrapped = torch.compiler.export_python(
+                path=self._tmp_path(f"alias_{len(kwargs)}.py"), **kwargs
+            )(fn)
+            a = x.clone().requires_grad_(True)
+            out = wrapped(a, x)
+            out[1].sum().backward()
+            return out[1].grad_fn is not None, a.grad
+
+        checked_has_gf, checked_grad = grad_of()
+        lean_has_gf, lean_grad = grad_of(unsafe_reduce_overhead=True)
+        self.assertTrue(checked_has_gf)
+        self.assertTrue(lean_has_gf)
+        self.assertEqual(checked_grad, lean_grad)
+
+    def test_lean_entry_bail_outs_fall_back_to_checked(self, device):
+        # Each of these needs the driver to marshal rather than check, so binding the
+        # lean entry over them would produce wrong results rather than an error.
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+
+        def nested_input(pair, *, out=None):
+            return pair[0] + pair[1]
+
+        def dict_output(a, *, out=None):
+            return {"y": a + 1}
+
+        cases = {
+            "nested_input": (
+                nested_input,
+                ((x, x),),
+                lambda r: self.assertEqual(r, x + x),
+            ),
+            "dict_output": (
+                dict_output,
+                (x,),
+                lambda r: self.assertEqual(r["y"], x + 1),
+            ),
+        }
+        for name, (fn, args, check) in cases.items():
+            wrapped = torch.compiler.export_python(
+                path=self._tmp_path(f"bail_{name}.py"),
+                backend="eager",
+                unsafe_reduce_overhead=True,
+            )(fn)
+            with self.assertLogs("torch.compiler._export_python", "WARNING") as logs:
+                check(wrapped(*args))
+            self.assertTrue(
+                any("had no effect" in m for m in logs.output), f"{name}: {logs.output}"
+            )
+            self.assertFalse(_artifact_of(wrapped)._lean_bound)
+            with self.assertRaisesRegex(TypeError, "out= is not available"):
+                wrapped(*args, out=(torch.empty_like(x),))
+
+    def test_artifact_raising_at_module_scope_is_a_distinct_error(self, device):
+        # The third arm of _load's taxonomy: not a syntax/structure problem and not a
+        # failed import, but source that blows up while being exec'd.
+        path = self._tmp_path("raises.py")
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+
+        @torch.compiler.export_python(path=path, backend="eager")
+        def run(inp):
+            return inp + 1
+
+        self.assertEqual(run(x), x + 1)
+        with open(path, encoding="utf-8") as f:
+            code = f.read()
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("raise RuntimeError('boom')\n" + code)
+
+        @torch.compiler.export_python(path=path, backend="eager")
+        def loaded(inp):
+            return inp + 1
+
+        with self.assertRaisesRegex(PrecompileError, "unexpected error occurred"):
+            loaded(x)
+
+    def test_nested_submodule_training_state_is_guarded(self, device):
+        # named_modules() walks the whole tree, but every other test model is a leaf,
+        # so only this pins that a flip on a CHILD is caught.
+        path = self._tmp_path("nested_training.py")
+
+        class Inner(torch.nn.Module):
+            def forward(self, inp):
+                return inp + 1 if self.training else inp - 1
+
+        class Outer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.inner = Inner()
+
+            def forward(self, inp):
+                return self.inner(inp)
+
+        model = Outer().to(device).train()
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+
+        @torch.compiler.export_python(path=path, backend="eager")
+        def run(mod, inp):
+            return mod(inp)
+
+        self.assertEqual(run(model, x), x + 1)
+        model.inner.eval()  # the root stays in train()
+
+        @torch.compiler.export_python(path=path, backend="eager")
+        def loaded(mod, inp):
+            return mod(inp)
+
+        with self.assertRaisesRegex(PrecompileError, "training state"):
+            loaded(model, x)
+
+    def test_recursive_decorated_function_raises_not_hangs(self, device):
+        path = self._tmp_path("recursive.py")
+        depth = [1]
+
+        @torch.compiler.export_python(path=path, backend="eager")
+        def f(inp):
+            if depth[0] > 0:
+                depth[0] -= 1
+                return f(inp + 1)
+            return inp * 2
+
+        with self.assertRaisesRegex(PrecompileError, "re-entrant call"):
+            f(make_tensor((4,), device=device, dtype=torch.float32))
+
+    def test_mangled_training_stamp_degrades_like_a_missing_one(self, device):
+        # The stamp is an exec-inert comment; a botched hand-edit of it must not raise
+        # a SyntaxError from a line that does not affect what the artifact runs.
+        path = self._tmp_path("mangled_stamp.py")
+
+        class Model(torch.nn.Module):
+            def forward(self, inp):
+                return inp + 1
+
+        model = Model().to(device)
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+
+        @torch.compiler.export_python(path=path, backend="eager")
+        def run(mod, inp):
+            return mod(inp)
+
+        self.assertEqual(run(model, x), x + 1)
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+        for i, line in enumerate(lines):
+            if "module-training:" in line:
+                lines[i] = line.split(":")[0] + ": [(0, [('', unclosed\n"
+        with open(path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+
+        @torch.compiler.export_python(path=path, backend="eager")
+        def loaded(mod, inp):
+            return mod(inp)
+
+        with self.assertLogs("torch.compiler._export_python", "WARNING") as logs:
+            self.assertEqual(loaded(model, x), x + 1)
+        self.assertTrue(any("no recorded training state" in m for m in logs.output))
+
+    def test_artifact_deleted_between_gate_and_read_regenerates(self, device):
+        # A peer deleting the artifact to force a regenerate must not surface as a bare
+        # FileNotFoundError from behind the presence gate.
+        path = self._tmp_path("toctou.py")
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+
+        @torch.compiler.export_python(path=path, backend="eager")
+        def seed(inp):
+            return inp + 1
+
+        self.assertEqual(seed(x), x + 1)
+
+        real_exists = os.path.exists
+
+        def exists_then_delete(p):
+            result = real_exists(p)
+            if p == path and result:
+                os.remove(p)
+            return result
+
+        @torch.compiler.export_python(path=path, backend="eager")
+        def racer(inp):
+            return inp + 1
+
+        with mock.patch.object(os.path, "exists", exists_then_delete):
+            self.assertEqual(racer(x), x + 1)
+        self.assertTrue(real_exists(path))
+
+    def test_path_naming_a_directory_is_a_clean_error(self, device):
+        path = self._tmp_path("adirectory.py")
+        os.makedirs(path)
+
+        @torch.compiler.export_python(path=path, backend="eager")
+        def run(inp):
+            return inp + 1
+
+        with self.assertRaisesRegex(PrecompileError, "readable file"):
+            run(make_tensor((4,), device=device, dtype=torch.float32))
+
+    def test_bare_tensor_out_is_rejected_by_name(self, device):
+        @torch.compiler.export_python(
+            path=self._tmp_path("bare_out.py"), unsafe_reduce_overhead=True
+        )
+        def run(inp, *, out=None):
+            return inp.sin() + 1
+
+        x = make_tensor((8,), device=device, dtype=torch.float32)
+        with self.assertRaisesRegex(TypeError, "must be a sequence of tensors"):
+            run(x, out=torch.empty_like(x))
+
+    def test_none_and_nested_module_arguments_name_their_own_cause(self, device):
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+
+        @torch.compiler.export_python(path=self._tmp_path("none.py"), backend="eager")
+        def optional(inp, mask=None):
+            return inp + 1
+
+        with self.assertRaisesRegex(TypeError, "does not support None arguments"):
+            optional(x)
+
+        @torch.compiler.export_python(
+            path=self._tmp_path("nestmod.py"), backend="eager"
+        )
+        def nested(mods, inp):
+            return mods[0](inp)
+
+        with self.assertRaisesRegex(TypeError, "must be passed directly"):
+            nested([torch.nn.Linear(4, 4).to(device)], x)
+
+    def test_genuine_out_parameter_is_not_hijacked(self, device):
+        # ``out`` is only reserved when declared keyword-only with a None default; a
+        # plain tensor parameter that happens to be named out must still bind.
+        @torch.compiler.export_python(
+            path=self._tmp_path("genuine.py"), backend="eager"
+        )
+        def run(a, out):
+            return a + out
+
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+        self.assertEqual(run(x, out=x), x + x)
+
+    def test_capture_failure_leaves_rng_alone(self, device):
+        # A rejected capture has no graph to attribute draws to, so it must not rewind:
+        # capture rejections are routine and would replay a concurrent thread's draws.
+        import torch._precompile as precompile_impl
+
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+
+        @torch.compiler.export_python(
+            path=self._tmp_path("capture_fail.py"), backend="eager"
+        )
+        def run(inp):
+            return torch.rand_like(inp)
+
+        def boom(*args, **kwargs):
+            torch.rand(4)  # the half-run fn drew before failing
+            raise PrecompileError("synthetic capture failure")
+
+        torch.manual_seed(1234)
+        before = torch.random.get_rng_state().clone()
+        with mock.patch.object(precompile_impl, "_capture", boom):
+            with self.assertRaisesRegex(PrecompileError, "synthetic capture failure"):
+                run(x)
+        self.assertNotEqual(torch.random.get_rng_state(), before)
+
+    def test_gated_op_configured_not_to_draw_does_not_count_as_drawing(self, device):
+        # nondeterministic_seeded marks ops that MAY draw; the gate reads the argument
+        # that decides. SDPA is what actually exercises it: dropout(train=False) traces
+        # to no seeded op at all, so it would pass without any gate, and
+        # dropout(train=True) decomposes to bernoulli_, which is not a gated name.
+        from torch._precompile import (
+            _capture,
+            _graph_rng_devices,
+            _op_can_draw,
+            _rng_devices_indicate_a_draw,
+        )
+
+        q = make_tensor((1, 1, 8, 16), device=device, dtype=torch.float32)
+
+        def sdpa(a, p):
+            return torch.nn.functional.scaled_dot_product_attention(
+                a, a, a, dropout_p=p
+            )
+
+        def seeded(gm):
+            return [
+                n.target
+                for n in gm.graph.nodes
+                if isinstance(n.target, torch._ops.OpOverload)
+                and torch.Tag.nondeterministic_seeded in n.target.tags
+            ]
+
+        dead = _capture(lambda a: sdpa(a, 0.0), (q,), None).gm
+        live = _capture(lambda a: sdpa(a, 0.2), (q,), None).gm
+        # The no-draw graph still CONTAINS a tagged op, so the gate is the only thing
+        # that can classify it as non-drawing; without this assertion the next one
+        # would hold vacuously (which is how the previous version of this test passed).
+        self.assertTrue(seeded(dead), "expected a tagged SDPA op in the graph")
+        self.assertFalse(_rng_devices_indicate_a_draw(_graph_rng_devices(dead)))
+        self.assertTrue(_rng_devices_indicate_a_draw(_graph_rng_devices(live)))
+        # dropout_p is omitted from node.args at 0.0, so the schema-default arm of the
+        # lookup is covered too.
+        self.assertFalse(any(_op_can_draw(n) for n in dead.graph.nodes))
+
+    def test_rng_gate_table_matches_the_op_registry(self, device):
+        # The table is a hand-listed subset of the op registry, so it rots silently in
+        # both directions: a typo'd key never fires, and a newly tagged gated op that
+        # is missing is treated as always-drawing (rewinding concurrent work). Rebuild
+        # it from the static schema registry and compare. _jit_get_all_schemas is used
+        # rather than dir(torch.ops.aten), which grows as other tests touch ops.
+        from torch._precompile import _RNG_GATED_BY_ARG
+
+        discovered = {}
+        for schema in torch._C._jit_get_all_schemas():
+            if not schema.name.startswith("aten::"):
+                continue
+            args = [a.name for a in schema.arguments]
+            # Only names that genuinely gate drawing. "p"/"prob" are NOT gates:
+            # bernoulli(p=0.0) and geometric_(p=...) still consume randomness.
+            gate = next(
+                (g for g in ("dropout_p", "train", "training") if g in args), None
+            )
+            if gate is None:
+                continue
+            packet = getattr(torch.ops.aten, schema.name.split("::")[1], None)
+            overload = schema.overload_name or "default"
+            op = getattr(packet, overload, None) if packet is not None else None
+            if op is not None and torch.Tag.nondeterministic_seeded in op.tags:
+                discovered.setdefault(schema.name, gate)
+        self.assertEqual(discovered, dict(_RNG_GATED_BY_ARG))
+
+    def test_nested_call_inside_a_donating_call_is_not_served_the_pool(self, device):
+        # Thread confinement is not enough: a re-entrant call on the OWNING thread (an
+        # opaque op calling back into the artifact) is indistinguishable from the
+        # graph's own requests, so it would be handed the donor's buffers and then
+        # clobbered by the next donating call.
+        lib = self._library("precompile_reentry")
+        lib.define("hook(Tensor x) -> Tensor")
+        state = {}
+
+        def hook(x):
+            if state.get("armed") and not state.get("busy"):
+                state["busy"] = True
+                try:
+                    state["nested"] = state["fn"](x + 1.0, state["w"])
+                finally:
+                    state["busy"] = False
+            return x.clone()
+
+        lib.impl("hook", hook, "CompositeExplicitAutograd")
+
+        @torch.compiler.export_python(
+            path=self._tmp_path("reentry.py"), unsafe_reduce_overhead=True
+        )
+        def run(inp, w, *, out=None):
+            return (torch.ops.precompile_reentry.hook(inp) @ w).relu().sin() + 1
+
+        n = 64
+        x = make_tensor((n, n), device=device, dtype=torch.float32)
+        w = make_tensor((n, n), device=device, dtype=torch.float32)
+        state.update(fn=run, w=w)
+        expected = run(x, w).clone()
+        donor = torch.empty_like(expected)
+        run(x, w, out=(donor,))  # record
+
+        state["armed"] = True
+        run(x, w, out=(donor,))  # replay, with a nested plain call inside it
+        nested = state["nested"].clone()
+        state["armed"] = False
+        run(x, w, out=(donor,))  # a later donating call must not touch nested's memory
+        self.assertEqual(state["nested"], nested)
+        self.assertNotEqual(state["nested"].data_ptr(), donor.data_ptr())
+        self.assertEqual(donor, expected)
+
+    def test_capture_drawing_only_on_the_accelerator_leaves_cpu_rng_alone(self, device):
+        # The restore is per generator, not all-or-nothing: rewinding the CPU generator
+        # for a graph that only drew on CUDA replays an unrelated CPU draw.
+        if not TEST_CUDA or torch.device(device).type != "cuda":
+            self.skipTest("needs a non-CPU generator to draw from")
+        path = self._tmp_path("cuda_only_rng.py")
+
+        @torch.compiler.export_python(path=path, backend="eager")
+        def run(inp):
+            return torch.rand_like(inp)
+
+        x = torch.zeros(4, device=device)
+        torch.manual_seed(1234)
+        error, concurrent = self._capture_racing_a_concurrent_draw(run, x)
+        self.assertIsNone(error)
+        self.assertNotEqual(torch.rand(8), concurrent)
+
+    def test_donating_call_desync_is_loud(self, device):
+        # The plan is replayed BY ORDER, so a call that asks for a different number of
+        # buffers than was recorded was served the wrong memory. That cannot happen for
+        # a shape-specialized graph, but if it ever does it must be loud rather than
+        # quietly wrong forever.
+        @torch.compiler.export_python(
+            path=self._tmp_path("desync.py"), unsafe_reduce_overhead=True
+        )
+        def run(inp, *, out=None):
+            return inp.sin() + 1
+
+        x = make_tensor((64,), device=device, dtype=torch.float32)
+        donor = torch.empty_like(run(x))
+        run(x, out=(donor,))
+        pool = _pool_of(run)
+        # Make the replay request one buffer fewer than the plan holds.
+        pool._plan.append((torch.empty_like(donor), -1))
+        with self.assertRaisesRegex(PrecompileError, "out of sync"):
+            run(x, out=(donor,))
+
+    def test_second_donating_call_in_flight_raises(self, device):
+        # A real in-flight call, not a hand-set owner field: an earlier version of this
+        # test reset the claim in a finally, so it passed even when the rejected caller
+        # tore the in-flight one down. Assert the in-flight call SURVIVES -- that is the
+        # bug. The owner stays on THIS thread because a donating call from another
+        # thread is separately (and correctly) refused by the recorded-stream check.
+        import threading
+
+        lib = self._library("precompile_park")
+        lib.define("park(Tensor x) -> Tensor")
+        state = {}
+
+        def park(x):
+            if state.get("armed") and "rejected" not in state:
+                state["rejected"] = "no error"
+
+                def intruder():
+                    try:
+                        run(a, w, out=(second,))
+                    except BaseException as e:
+                        state["rejected"] = repr(e)
+
+                thread = threading.Thread(target=intruder)
+                thread.start()
+                thread.join(60)
+                state["alive"] = thread.is_alive()
+            return x.clone()
+
+        lib.impl("park", park, "CompositeExplicitAutograd")
+
+        @torch.compiler.export_python(
+            path=self._tmp_path("in_flight.py"), unsafe_reduce_overhead=True
+        )
+        def run(a_, w_, *, out=None):
+            return (torch.ops.precompile_park.park(a_) @ w_).relu()
+
+        n = 64
+        a = make_tensor((n, n), device=device, dtype=torch.float32)
+        w = make_tensor((n, n), device=device, dtype=torch.float32)
+        expected = run(a, w).clone()
+        first, second = torch.empty_like(expected), torch.empty_like(expected)
+        run(a, w, out=(first,))  # record, so the armed call takes the replay path
+
+        state["armed"] = True
+        self.assertEqual(run(a, w, out=(first,)), expected)  # in-flight call survives
+        self.assertEqual(first, expected)
+        self.assertFalse(state.get("alive"))
+        self.assertIn("already in flight", state["rejected"])
+        # ...and the artifact still works afterwards.
+        state["armed"] = False
+        self.assertEqual(run(a, w, out=(second,)), expected)
+
+    def test_recording_call_that_raises_is_not_sticky(self, device):
+        # The recording call holds the plan too. If an exception out of the traced call
+        # leaked the hold, out= would be dead for the process and the message would
+        # blame a concurrent call that does not exist. A wrong-shaped input under the
+        # lean entry point trips inductor's own host-side assert, which is device
+        # agnostic (an out-of-range index would be an async device assert on CUDA and
+        # would poison the context for every later test).
+        @torch.compiler.export_python(
+            path=self._tmp_path("record_raises.py"), unsafe_reduce_overhead=True
+        )
+        def run(inp, *, out=None):
+            return inp.sin() + 1
+
+        x = make_tensor((8, 8), device=device, dtype=torch.float32)
+        expected = run(x).clone()  # materialize on the right shape first
+        wrong = make_tensor((16, 16), device=device, dtype=torch.float32)
+        with self.assertRaises(Exception):
+            run(wrong, out=(torch.empty_like(wrong),))
+        donor = torch.empty_like(expected)
+        self.assertEqual(run(x, out=(donor,)), expected)
+
+    def test_donating_call_rejection_is_not_sticky(self, device):
+        # A rejected donating call must leave the artifact usable. Leaving the claim
+        # set would wedge out= for the process and blame a phantom concurrent call.
+        @torch.compiler.export_python(
+            path=self._tmp_path("not_sticky.py"), unsafe_reduce_overhead=True
+        )
+        def run(inp, *, out=None):
+            return inp.flip(0) + 1
+
+        x = torch.arange(8.0, device=device)
+        donor = torch.empty_like(x)
+        expected = run(x).clone()
+        run(x, out=(donor,))
+
+        # Each of begin()'s rejection paths, then a good call after every one.
+        with self.assertRaisesRegex(PrecompileError, "overlaps"):
+            run(donor, out=(donor,))
+        self.assertEqual(run(x, out=(donor,)), expected)
+        # A same-numel, wrong-dtype donor rather than an undersized one: if the guard
+        # ever regresses, this degrades to wrong numbers instead of an out-of-bounds
+        # write that aborts the interpreter and takes the rest of the suite with it.
+        with self.assertRaisesRegex(PrecompileError, "must be a plain Tensor"):
+            run(x, out=(torch.empty(8, device=device, dtype=torch.float64),))
+        self.assertEqual(run(x, out=(donor,)), expected)
+        with self.assertRaisesRegex(PrecompileError, "recorded plan donates"):
+            run(x, out=(donor, donor))
+        self.assertEqual(run(x, out=(donor,)), expected)
+
+    def test_gate_does_not_apply_to_a_lookalike_custom_op(self, device):
+        # The table is keyed on the qualified name. A custom op that merely shares a
+        # name with a gated aten op must stay conservative, or a graph that really
+        # draws is reported as not drawing and its consumed state is never restored.
+        from torch._precompile import _op_can_draw
+
+        lib = self._library("precompile_gate_test")
+        lib.define(
+            "dropout(Tensor input, float p, bool train) -> Tensor",
+            tags=(torch.Tag.nondeterministic_seeded,),
+        )
+        graph = torch.fx.Graph()
+        arg = graph.placeholder("x")
+        node = graph.call_function(
+            torch.ops.precompile_gate_test.dropout.default, (arg, 0.5, False)
+        )
+        self.assertTrue(_op_can_draw(node), "a lookalike op inherited aten's gate")
+
+    def _rope_artifact(self, device, **kwargs):
+        # Two outputs, both plain allocated buffers: the shape out= is designed for.
+        path = self._tmp_path("out_rope.py")
+
+        @torch.compiler.export_python(path=path, **kwargs)
+        def run(a, b, c, *, out=None):
+            return a * c + b, b * c - a
+
+        return run
+
+    def test_out_donation_matches(self, device):
+        # Donated outputs must hold exactly what the allocating call returns, on the
+        # recording call (which fills them by hand) and on every replayed call after.
+        run = self._rope_artifact(device, unsafe_reduce_overhead=True)
+        self.assertIn("out", inspect.signature(run).parameters)
+        args = [
+            make_tensor((8, 8), device=device, dtype=torch.float32) for _ in range(3)
+        ]
+        expected = run(*args)
+
+        o0 = torch.empty_like(expected[0])
+        o1 = torch.empty_like(expected[1])
+        first = run(*args, out=(o0, o1))
+        self.assertIs(first[0], o0)
+        self.assertIs(first[1], o1)
+        self.assertEqual(first, expected)
+
+        # A second donating call goes through the recorded plan, not the recording
+        # path, and must land in the same tensors.
+        o0.zero_()
+        o1.zero_()
+        again = run(*args, out=(o0, o1))
+        self.assertIs(again[0], o0)
+        self.assertEqual(again, expected)
+
+        # A plain call afterwards still allocates its own outputs.
+        plain = run(*args)
+        self.assertIsNot(plain[0], o0)
+        self.assertEqual(plain, expected)
+
+    def test_out_donation_new_inputs(self, device):
+        # The recorded plan must not pin the inputs: different input values through the
+        # same donated buffers have to recompute, not replay a stale result.
+        run = self._rope_artifact(device, unsafe_reduce_overhead=True)
+        args = [
+            make_tensor((8, 8), device=device, dtype=torch.float32) for _ in range(3)
+        ]
+        o0 = torch.empty((8, 8), device=device, dtype=torch.float32)
+        o1 = torch.empty((8, 8), device=device, dtype=torch.float32)
+        run(*args, out=(o0, o1))
+
+        args2 = [
+            make_tensor((8, 8), device=device, dtype=torch.float32) for _ in range(3)
+        ]
+        run(*args2, out=(o0, o1))
+        self.assertEqual((o0, o1), run(*args2))
+
+    def test_out_requires_unsafe_reduce_overhead(self, device):
+        run = self._rope_artifact(device)
+        args = [
+            make_tensor((8, 8), device=device, dtype=torch.float32) for _ in range(3)
+        ]
+        o = torch.empty((8, 8), device=device, dtype=torch.float32)
+        with self.assertRaisesRegex(TypeError, "out= requires unsafe_reduce_overhead"):
+            run(*args, out=(o, o.clone()))
+
+    def test_out_requires_explicit_signature(self, device):
+        path = self._tmp_path("out_undeclared.py")
+
+        @torch.compiler.export_python(path=path, unsafe_reduce_overhead=True)
+        def run(inp):
+            return inp + 1
+
+        x = make_tensor((8, 8), device=device, dtype=torch.float32)
+        with self.assertRaisesRegex(TypeError, "keyword-only `out=None`"):
+            run(x, out=(torch.empty_like(x),))
+        self.assertFalse(os.path.exists(path))
+
+    def test_out_mismatched_donor_rejected(self, device):
+        # The donated tensors are checked once, on the recording call: a kernel writing
+        # through baked sizes into a too-small buffer is memory corruption, not a wrong
+        # number, so this one check is worth its one-time cost.
+        run = self._rope_artifact(device, unsafe_reduce_overhead=True)
+        args = [
+            make_tensor((8, 8), device=device, dtype=torch.float32) for _ in range(3)
+        ]
+        good = torch.empty((8, 8), device=device, dtype=torch.float32)
+        plain = r"out\[1\] must be a plain Tensor"
+        with self.assertRaisesRegex(PrecompileError, plain):
+            run(*args, out=(good, torch.empty((4, 4), device=device)))
+        with self.assertRaisesRegex(PrecompileError, "out= has 1 tensors"):
+            run(*args, out=(good,))
+        expected = run(*args)
+        o0 = torch.empty_like(expected[0])
+        o1 = torch.empty_like(expected[1])
+        self.assertEqual(run(*args, out=(o0, o1)), expected)
+        self.assertEqual(run(*args, out=(o0, o1)), expected)
+        # Replay calls re-run the full donor check, so a non-Tensor donor is named as
+        # such rather than surfacing later as an aliasing or arity failure.
+        with self.assertRaisesRegex(
+            PrecompileError, r"out\[1\] must be a plain Tensor"
+        ):
+            run(*args, out=(o0, 5))
+
+    def test_out_rejects_misaligned_cuda_donor(self, device):
+        if not TEST_CUDA or torch.device(device).type != "cuda":
+            self.skipTest("CUDA output alignment")
+        from torch._inductor.utils import GPU_ALIGN_BYTES
+
+        @torch.compiler.export_python(
+            path=self._tmp_path("out_alignment.py"), unsafe_reduce_overhead=True
+        )
+        def run(inp, *, out=None):
+            return inp.sin() + 1
+
+        x = make_tensor((1024,), device=device, dtype=torch.float32)
+        base = torch.empty(1025, device=device)
+        donor = base[1:]
+        self.assertNotEqual(donor.data_ptr() % GPU_ALIGN_BYTES, 0)
+        with self.assertRaisesRegex(PrecompileError, "aligned"):
+            run(x, out=(donor,))
+
+    def test_out_rejects_storage_less_tensor_subclass(self, device):
+        from torch.testing._internal.logging_tensor import LoggingTensor
+
+        @torch.compiler.export_python(
+            path=self._tmp_path("out_subclass.py"), unsafe_reduce_overhead=True
+        )
+        def run(inp, *, out=None):
+            return inp + 1
+
+        x = make_tensor((8,), device=device, dtype=torch.float32)
+        donor = LoggingTensor(torch.empty_like(x))
+        with self.assertRaisesRegex(PrecompileError, "plain Tensor"):
+            run(x, out=(donor,))
+
+    def test_out_rejects_overlapping_storage(self, device):
+        run = self._rope_artifact(device, unsafe_reduce_overhead=True)
+        args = [
+            make_tensor((8, 8), device=device, dtype=torch.float32) for _ in range(3)
+        ]
+        donor = torch.empty_like(args[0])
+        with self.assertRaisesRegex(PrecompileError, "overlaps"):
+            run(*args, out=(donor, donor))
+        with self.assertRaisesRegex(PrecompileError, "overlaps"):
+            run(*args, out=(args[0], torch.empty_like(args[0])))
+
+    def test_out_replay_rejects_new_input_overlap(self, device):
+        @torch.compiler.export_python(
+            path=self._tmp_path("out_replay_overlap.py"),
+            unsafe_reduce_overhead=True,
+        )
+        def run(inp, *, out=None):
+            return inp.flip(0) + 1
+
+        x = torch.arange(8.0, device=device)
+        donor = torch.empty_like(x)
+        run(x, out=(donor,))
+        donor.copy_(x)
+        with self.assertRaisesRegex(PrecompileError, "overlaps"):
+            run(donor, out=(donor,))
+
+    def test_out_rejects_repeated_output(self, device):
+        path = self._tmp_path("out_alias.py")
+
+        @torch.compiler.export_python(path=path, unsafe_reduce_overhead=True)
+        def run(inp, *, out=None):
+            result = inp + 1
+            return result, result
+
+        x = make_tensor((8, 8), device=device, dtype=torch.float32)
+        with self.assertRaisesRegex(PrecompileError, "aliases output"):
+            run(x, out=(torch.empty_like(x), torch.empty_like(x)))
+
+    def test_out_replay_increments_version(self, device):
+        path = self._tmp_path("out_version.py")
+
+        @torch.compiler.export_python(path=path, unsafe_reduce_overhead=True)
+        def run(inp, *, out=None):
+            return inp + 1
+
+        # The donor itself must NOT require grad -- eager's out= refuses a leaf that
+        # does, and so does donation. The version bump is still what lets a consumer
+        # that saved the donor for backward diagnose the mutation.
+        x = make_tensor((8, 8), device=device, dtype=torch.float32)
+        w = make_tensor((8, 8), device=device, dtype=torch.float32).requires_grad_(True)
+        donor = torch.empty_like(x)
+        run(x, out=(donor,))
+        loss = (donor * w).sum()  # saves donor for w's gradient
+        run(x + 1, out=(donor,))
+        with self.assertRaisesRegex(RuntimeError, "modified by an inplace operation"):
+            loss.backward()
+
+    def test_replay_rechecks_donor_metadata(self, device):
+        # The per-call recheck, isolated. A float64 donor of the same shape is large
+        # enough that the kernel's write stays in bounds, so without the recheck this
+        # degrades to wrong numbers rather than a crash -- which is what makes it a
+        # usable test rather than a SIGABRT that takes the rest of the run with it.
+        @torch.compiler.export_python(
+            path=self._tmp_path("replay_recheck.py"), unsafe_reduce_overhead=True
+        )
+        def run(inp, *, out=None):
+            return inp.sin() + 1
+
+        x = make_tensor((8, 8), device=device, dtype=torch.float32)
+        expected = x.sin() + 1
+        donor = torch.empty_like(expected)
+        self.assertEqual(run(x, out=(donor,)), expected)
+        wrong = torch.empty(8, 8, device=device, dtype=torch.float64)
+        with self.assertRaisesRegex(PrecompileError, "must be a plain Tensor"):
+            run(x, out=(wrong,))
+        self.assertEqual(run(x, out=(donor,)), expected)
+
+    def test_untagged_drawing_op_still_restores(self, device):
+        # An opaque custom op can draw inside its own kernel with nothing in the graph
+        # to say so -- the shape this API targets. Attributing the restore per device
+        # would leave those draws un-restored, so a non-aten op in the graph has to
+        # fall back to restoring every snapshotted generator.
+        lib = self._library("precompile_untagged")
+        lib.define("draw(Tensor x) -> Tensor")
+        lib.impl("draw", lambda x: x + torch.rand_like(x), "CompositeExplicitAutograd")
+        path = self._tmp_path("untagged.py")
+
+        def build():
+            @torch.compiler.export_python(path=path, backend="eager")
+            def run(inp):
+                return torch.ops.precompile_untagged.draw(inp)
+
+            return run
+
+        x = torch.zeros(4, device=device)
+        torch.manual_seed(1234)
+        first = build()(x).clone()
+        torch.manual_seed(1234)
+        self.assertEqual(build()(x), first)
+
+    def test_fake_traced_capture_consumes_no_rng(self, device):
+        # Why the restore is skipped for a fake-traced capture: mark_unbacked traces on
+        # FakeTensors, so no kernel runs and nothing is consumed, even though the graph
+        # contains a drawing op. Restoring on the strength of the graph alone would
+        # rewind whatever a concurrent thread drew, for a capture that took nothing.
+        # (Only the premise is asserted here: the skip itself is unobservable through
+        # the public API, because the artifact's own real run redraws immediately.)
+        from torch._precompile import _capture, _graph_rng_devices
+
+        x = make_tensor((64,), device=device, dtype=torch.float32)
+        mark_unbacked(x, 0)
+        torch.manual_seed(1234)
+        before = torch.random.get_rng_state().clone()
+        capture = _capture(
+            lambda i: torch.nn.functional.dropout(i, 0.5, True), (x,), None
+        )
+        self.assertIsNotNone(capture.fake_mode)
+        self.assertEqual(torch.random.get_rng_state(), before)
+        # Anti-vacuity: the graph really does contain a draw the device scan attributes,
+        # so skipping the restore is a decision and not an empty set falling through.
+        self.assertTrue(_graph_rng_devices(capture.gm))
+
+    def test_inputs_sliced_from_one_buffer_are_not_aliased(self, device):
+        # Overlap must mean sharing actual bytes. torch._C._overlaps answers a different
+        # question -- storage IDENTITY -- and using it here rejected the arena /
+        # fused-QKV / KV-cache shape, where every input is a disjoint slice of one
+        # buffer. That is the main way real callers hand tensors to a kernel.
+        from torch.compiler._export_python import _shares_memory
+
+        base = make_tensor((8,), device=device, dtype=torch.float32)
+        self.assertFalse(_shares_memory(base[:4], base[4:]))
+        self.assertTrue(_shares_memory(base[:5], base[3:]))
+        self.assertTrue(_shares_memory(base, base))
+        self.assertFalse(_shares_memory(base[:0], base))
+
+        @torch.compiler.export_python(
+            path=self._tmp_path("arena_inputs.py"),
+            backend="eager",
+            example_inputs=(
+                make_tensor((4,), device=device, dtype=torch.float32),
+                make_tensor((4,), device=device, dtype=torch.float32),
+            ),
+        )
+        def add(a, b):
+            return a + b
+
+        buf = make_tensor((8,), device=device, dtype=torch.float32)
+        self.assertEqual(add(buf[:4], buf[4:]), buf[:4] + buf[4:])
+
+    def test_overlap_is_bytes_not_storage_identity(self, device):
+        # Two tensors can reach the same bytes through DIFFERENT UntypedStorages --
+        # from_numpy on overlapping slices, frombuffer, DLPack, __cuda_array_interface__
+        # onto a live arena. A storage-identity gate calls those disjoint, and a donor
+        # would then be written straight over a live input.
+        import numpy as np
+
+        from torch.compiler._export_python import _shares_memory
+
+        arr = np.zeros(1024, dtype=np.float32)
+        lo, hi = torch.from_numpy(arr[0:512]), torch.from_numpy(arr[256:768])
+        self.assertNotEqual(
+            lo.untyped_storage().data_ptr(), hi.untyped_storage().data_ptr()
+        )
+        self.assertTrue(_shares_memory(lo, hi))
+
+        # Exactly ONE element of overlap: a two-element case survives dropping the +1
+        # from the span, so only this pins the boundary.
+        base = make_tensor((8,), device=device, dtype=torch.float32)
+        self.assertTrue(_shares_memory(base[:4], base[3:]))
+        self.assertFalse(_shares_memory(base[:4], base[4:]))
+        # A strided tensor's extent is not its numel; using numel under-reports it.
+        self.assertTrue(_shares_memory(base.as_strided((4,), (2,)), base[5:]))
+
+        # A wrapper subclass reports data_ptr() == 0 with a real device, so comparing
+        # its span directly would call every pair disjoint.
+        from torch.testing._internal.two_tensor import TwoTensor
+
+        payload = torch.from_numpy(np.zeros(8, dtype=np.float32))
+        self.assertTrue(
+            _shares_memory(
+                payload,
+                TwoTensor(payload, payload.clone()),
+            )
+        )
+        self.assertFalse(
+            _shares_memory(
+                TwoTensor(torch.zeros(4), torch.zeros(4)),
+                TwoTensor(torch.zeros(4), torch.zeros(4)),
+            )
+        )
+
+        # A 0-numel tensor whose bounding span is NOT empty: the numel guard is what
+        # rejects this, not the span arithmetic.
+        empty_wide = torch.empty(8, device=device).as_strided((3, 0), (1, 1))
+        self.assertFalse(_shares_memory(empty_wide, empty_wide))
+        self.assertFalse(
+            _shares_memory(torch.empty(4, device="meta"), torch.empty(4, device="meta"))
+        )
+
+    def test_out_is_read_once_at_the_boundary(self, device):
+        # The caller's sequence is snapshotted in __call__, so validation, the allocator
+        # and the autograd version bump all see the SAME tensors. Without that, a
+        # sequence that returns something different on a later read gets its version
+        # counter bumped on one tensor while the kernel writes another.
+        @torch.compiler.export_python(
+            path=self._tmp_path("read_once.py"), unsafe_reduce_overhead=True
+        )
+        def run(inp, *, out=None):
+            return inp.sin() + 1
+
+        x = make_tensor((8, 8), device=device, dtype=torch.float32)
+        expected = x.sin() + 1
+        good, decoy = torch.empty_like(expected), torch.empty_like(expected)
+        run(x, out=(good,))
+
+        class Shifty:
+            def __init__(self):
+                self.reads = 0
+
+            def __len__(self):
+                return 1
+
+            def __getitem__(self, i):
+                # Bounded: with no __iter__, tuple() falls back to the old sequence
+                # protocol and walks indices until IndexError.
+                if i != 0:
+                    raise IndexError(i)
+                self.reads += 1
+                return good if self.reads <= 2 else decoy
+
+        shifty = Shifty()
+        before_good, before_decoy = good._version, decoy._version
+        run(x, out=shifty)
+        # Exactly one read is the property: validation, the allocator and the version
+        # bump all see the same tuple. Without the boundary snapshot this is 4, and the
+        # decoy gets written and version-bumped while `good` is the one validated.
+        self.assertEqual(shifty.reads, 1)
+        self.assertEqual(good, expected)
+        self.assertGreater(good._version, before_good)
+        self.assertEqual(decoy._version, before_decoy)
+
+    def test_capture_copy_that_loses_parameter_aliasing_is_refused(self, device):
+        # nn.Parameter.__deepcopy__ is self.data.clone(), which does not join the
+        # storage memo, so two Parameters over one storage come back independent.
+        # Capturing from that copy bakes in aliasing the caller does not have.
+        class Tied(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                base = torch.zeros(8, device=device)
+                self.a = torch.nn.Parameter(base[:4])
+                self.b = torch.nn.Parameter(base[4:])
+                self.a.data, self.b.data = base[:4], base[:4]
+
+        def fn(mod, inp):
+            mod.a.data.add_(inp)
+            return mod.b.data + 0
+
+        one = torch.ones(4, device=device)
+        path = self._tmp_path("tied_param.py")
+        with self.assertRaisesRegex(PrecompileError, "example_inputs="):
+            torch.compiler.export_python(path=path)(fn)(Tied(), one)
+        # Refused before publishing: a later call must not load a poisoned artifact.
+        self.assertFalse(os.path.exists(path))
+
+        # The escape hatch the message names has to actually work, and agree with eager.
+        wrapped = torch.compiler.export_python(
+            path=self._tmp_path("tied_param_ex.py"), example_inputs=(Tied(), one)
+        )(fn)
+        self.assertEqual(wrapped(Tied(), one), fn(Tied(), one))
+        self.assertEqual(wrapped(Tied(), one), fn(Tied(), one))
+
+        # Weight tying through one shared Parameter OBJECT (the usual idiom) survives
+        # the copy, so it must still capture.
+        class ObjectTied(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.emb = torch.nn.Embedding(6, 4, device=device)
+                self.head = torch.nn.Linear(4, 6, bias=False, device=device)
+                self.head.weight = self.emb.weight
+
+            def forward(self, ids):
+                return self.head(self.emb(ids))
+
+        mod = ObjectTied()
+        ids = torch.zeros(2, dtype=torch.long, device=device)
+        run = torch.compiler.export_python(path=self._tmp_path("obj_tied.py"))(
+            lambda m, t: m(t)
+        )
+        self.assertEqual(run(mod, ids), mod(ids))
+
+    def test_overlap_handles_awkward_subclass_shapes(self, device):
+        # __tensor_flatten__ names the attributes to transform, and they are not all
+        # tensors -- DTensor's list carries its DeviceMesh. getattr on one used to
+        # escape as a bare AttributeError, which only RuntimeError was catching.
+        from torch.compiler._export_python import _dense_leaves, _shares_memory
+
+        class HasMetadata(TwoTensor):
+            def __tensor_flatten__(self):
+                attrs, ctx = super().__tensor_flatten__()
+                return [*attrs, "label"], ctx
+
+        base = make_tensor((8,), device=device, dtype=torch.float32)
+        side = make_tensor((8,), device=device, dtype=torch.float32)
+        wrapper = HasMetadata(base[:4], side[:4])  # TwoTensor wants matching offsets
+        wrapper.label = "not a tensor"
+        self.assertTrue(_shares_memory(base, wrapper))
+        self.assertTrue(_shares_memory(side, wrapper))
+        self.assertFalse(_shares_memory(torch.zeros(4, device=device), wrapper))
+
+        # A subclass that flattens to exactly ONE tensor is the arity that made the
+        # plain-tensor test an elementwise Tensor ==, which raises above numel 1.
+        single = AsyncCollectiveTensor(base[:4])
+        self.assertEqual(len(_dense_leaves(single)), 1)
+        self.assertTrue(_shares_memory(base[:4], single))
+        self.assertFalse(_shares_memory(base[4:], single))
+
+    def test_duplicate_input_objects_are_guarded(self, device):
+        # Byte overlap cannot tell "two views that intersect" from "one tensor passed
+        # twice", and AOTAutograd folds the second into a single graph slot. Both report
+        # the same overlapping index pair, so without the duplicate stamp an artifact
+        # captured from views silently computes the wrong thing on a repeated argument.
+        def fn(a, b):
+            a.add_(1.0)
+            return b * 10
+
+        path = self._tmp_path("dup.py")
+        wrapped = torch.compiler.export_python(path=path)(fn)
+
+        def arena():
+            return torch.zeros(8, device=device)
+
+        base = arena()
+        wrapped(base[0:4], base[2:6])  # capture: distinct, overlapping
+
+        # the same object twice: same pair set, different meaning
+        repeated = arena()[0:4]
+        with self.assertRaisesRegex(PrecompileError, "repeat tensor objects"):
+            wrapped(repeated, repeated)
+
+        # and the converse: captured from a repeat, called with distinct views
+        dup_path = self._tmp_path("dup2.py")
+        from_repeat = torch.compiler.export_python(path=dup_path)(fn)
+        first = arena()[0:4]
+        from_repeat(first, first)
+        other = arena()
+        with self.assertRaisesRegex(PrecompileError, "repeat tensor objects"):
+            from_repeat(other[0:4], other[2:6])
+
+        # a call that repeats the way capture did still runs, and matches eager
+        same = arena()[0:4]
+        eager_in = arena()[0:4]
+        self.assertEqual(from_repeat(same, same), fn(eager_in, eager_in))
+
+        # Identity, not address. These two have the SAME data_ptr and the same overlap
+        # pair set, but are distinct objects with different strides, so AOTAutograd does
+        # not fold them; keying the stamp on the address accepts this and returns wrong
+        # numbers with nothing else to catch it.
+        square = self._tmp_path("dup_square.py")
+        squared = torch.compiler.export_python(path=square)(fn)
+        cap = make_tensor((4, 4), device=device, dtype=torch.float32)
+        squared(cap, cap)
+        live = make_tensor((4, 4), device=device, dtype=torch.float32)
+        with self.assertRaisesRegex(PrecompileError, "repeat tensor objects"):
+            squared(live, live.t())
+
+    def test_overlap_sees_through_a_wrapper_that_misreports_its_device(self, device):
+        # A subclass can report a device differing from its payload's in INDEX
+        # (map_location="cuda" over a "cuda:0" payload) or in TYPE
+        # (map_location={"cuda:0": "cpu"}). Deciding on the wrapper rather than the leaf
+        # reported such a tensor as sharing memory with nothing -- including its own
+        # payload -- so a donor could be written straight over a live input.
+        from torch.compiler._export_python import _shares_memory
+
+        base = make_tensor((8,), device=device, dtype=torch.float32)
+        # No hardware needed for any of these: _make_wrapper_subclass takes a device
+        # LABEL, so they run identically on a CPU-only runner. Gating them on TEST_CUDA
+        # meant the type axis pinned nothing there, and the index axis alone cannot tell
+        # a leaf-keyed predicate from a wrapper-device-type-keyed one.
+        lies = [
+            _lying_device(device),  # index axis
+            _type_lying_device(device),  # type axis
+            torch.device("meta"),  # is_meta is a device report too
+        ]
+        for reported in lies:
+            wrapper = _MisreportedDevice(base[:4], reported)
+            self.assertNotEqual(wrapper.device, wrapper.payload.device)
+            self.assertTrue(_shares_memory(base[:4], wrapper), reported)
+            self.assertTrue(_shares_memory(base[2:6], wrapper), reported)
+            self.assertFalse(_shares_memory(base[4:], wrapper), reported)
+            self.assertFalse(
+                _shares_memory(
+                    make_tensor((4,), device=device, dtype=torch.float32), wrapper
+                ),
+                reported,
+            )
+
+        # One empty component must not make the whole wrapper unlocatable. It used to,
+        # because every empty tensor reports data_ptr 0 -- which refused every donation
+        # against such an input, naming an overlap that does not exist.
+        from torch.compiler._export_python import _dense_leaves
+
+        side = make_tensor((8,), device=device, dtype=torch.float32)
+        unrelated = make_tensor((4,), device=device, dtype=torch.float32)
+        for spare in (
+            torch.empty(2, device=device),
+            torch.empty(0, device=device),  # owns no bytes
+            torch.empty(4, device="meta"),  # a leaf that genuinely IS meta
+        ):
+            partly_empty = TwoTensor(base[:4], side[:4])  # matching storage offsets
+            partly_empty.b = spare
+            self.assertIsNotNone(_dense_leaves(partly_empty), spare.device)
+            self.assertTrue(_shares_memory(base[:4], partly_empty), spare.device)
+            self.assertFalse(_shares_memory(unrelated, partly_empty), spare.device)
+
+        # Every component byte-less is a real answer -- "owns nothing" -- not "bytes we
+        # cannot find". Collapsing it back to unresolvable made such a wrapper alias
+        # every same-device-type tensor and refused every donation against it.
+        all_empty = TwoTensor(
+            torch.empty(0, device=device), torch.empty(0, device=device)
+        )
+        self.assertEqual(_dense_leaves(all_empty), [])
+        self.assertFalse(_shares_memory(unrelated, all_empty))
+        # But a wrapper with no tensor components at all stays conservative: there is
+        # nothing to have looked at, so it must not read as disjoint from everything.
+        no_tensors = TwoTensor(base[:4], side[:4])
+        no_tensors.__tensor_flatten__ = lambda: ([], None)  # type: ignore[method-assign]
+        self.assertIsNone(_dense_leaves(no_tensors))
+        self.assertTrue(_shares_memory(unrelated, no_tensors))
+
+        # A tensor whose bytes cannot be located at all is assumed to alias -- but only
+        # within its own device type, which is the only evidence left once there are no
+        # leaves to inspect. The sweep routes these to the same predicate, so its
+        # cross-check cannot pin this; it needs asserting directly.
+        opaque = make_tensor((4, 4), device=device, dtype=torch.float32).to_sparse()
+        self.assertTrue(_shares_memory(opaque, base[:4]))
+        if TEST_CUDA:
+            elsewhere = "cpu" if torch.device(device).type == "cuda" else "cuda"
+            self.assertFalse(_shares_memory(opaque, torch.randn(4, device=elsewhere)))
+
+    @unittest.skipUnless(TEST_CUDA, "needs a second device to re-point a donor onto")
+    def test_served_buffer_device_change_is_caught(self, device):
+        # Device is the one axis a mid-graph re-point can change while size, stride and
+        # dtype stay identical: .data= allows it where set_() refuses the cross-device
+        # storage. Unchecked, the generated kernel dereferences a device pointer as a
+        # host pointer (or the reverse) and the process dies with SIGSEGV.
+        other = "cpu" if torch.device(device).type == "cuda" else "cuda"
+        lib = self._library("precompile_devicehop")
+        lib.define("hop(Tensor x) -> Tensor")
+        state = {}
+
+        def hop(x):
+            if "donor" in state:
+                donor = state.pop("donor")
+                donor.data = torch.empty(donor.shape, dtype=donor.dtype, device=other)
+            return x.clone()
+
+        lib.impl("hop", hop, "CompositeExplicitAutograd")
+
+        @torch.compiler.export_python(
+            path=self._tmp_path("devicehop.py"), unsafe_reduce_overhead=True
+        )
+        def run(inp, *, out=None):
+            # a reduction so inductor cannot reuse the custom op's buffer, and so the
+            # output is written by a generated kernel rather than an ATen op that would
+            # device-check on the caller's behalf
+            return (torch.ops.precompile_devicehop.hop(inp).sum(dim=1) * 2.0).cos()
+
+        x = make_tensor((32, 32), device=device, dtype=torch.float32)
+        expected = run(x).clone()
+        donor = torch.empty_like(expected)
+        self.assertEqual(run(x, out=(donor,)), expected)
+
+        state["donor"] = donor
+        with self.assertRaisesRegex(PrecompileError, "no longer matches the request"):
+            run(x, out=(donor,))
+
+    @unittest.skipUnless(TEST_CUDA, "needs a second device to re-point scratch onto")
+    def test_pooled_scratch_device_change_is_caught(self, device):
+        # The pool's own scratch is NOT out of reach: inductor passes it into an opaque
+        # op as an argument, so .data= there re-points the very object the plan holds,
+        # and the next call serves it to a kernel built for the other device. Taking the
+        # expected device off the served buffer makes that comparison x != x.
+        other = "cpu" if torch.device(device).type == "cuda" else "cuda"
+        lib = self._library("precompile_scratchhop")
+        lib.define("stash(Tensor x) -> Tensor")
+        state = {}
+
+        def stash(x):
+            # a correct result, so the re-pointing call itself still completes: the
+            # damage lands on the NEXT call, which is where the check has to catch it
+            result = x.clone()
+            if state.pop("flip", False):
+                x.data = torch.empty_strided(
+                    x.shape, x.stride(), dtype=x.dtype, device=other
+                )
+            return result
+
+        lib.impl("stash", stash, "CompositeExplicitAutograd")
+
+        @torch.compiler.export_python(
+            path=self._tmp_path("scratchhop.py"), unsafe_reduce_overhead=True
+        )
+        def run(inp, *, out=None):
+            scratch = torch.ops.precompile_scratchhop.stash(inp * 2.0)
+            return (scratch.sum(dim=1) * 3.0).cos()
+
+        x = make_tensor((32, 32), device=device, dtype=torch.float32)
+        expected = run(x).clone()
+        donor = torch.empty_like(expected)
+        self.assertEqual(run(x, out=(donor,)), expected)
+        self.assertEqual(run(x, out=(donor,)), expected)
+
+        state["flip"] = True
+        run(x, out=(donor,))  # completes; leaves the pooled buffer on the other device
+        with self.assertRaisesRegex(PrecompileError, "no longer matches the request"):
+            run(x, out=(donor,))
+
+    @unittest.skipUnless(TEST_CUDA, "needs a second device to re-point scratch onto")
+    def test_pooled_scratch_repointed_during_recording_is_caught(self, device):
+        # The device the plan expects has to be read when the buffer is ALLOCATED. Read
+        # at plan-commit time it is read after the recording graph has run, so an op
+        # that re-points scratch unconditionally -- the natural shape, and the one an
+        # op written to do this would take -- poisons the expectation itself and the
+        # check compares wrong to wrong for the artifact's whole lifetime.
+        other = "cpu" if torch.device(device).type == "cuda" else "cuda"
+        lib = self._library("precompile_earlyhop")
+        lib.define("hop(Tensor x) -> Tensor")
+
+        def hop(x):
+            result = x.clone()
+            x.data = torch.empty_strided(
+                x.shape, x.stride(), dtype=x.dtype, device=other
+            )
+            return result
+
+        lib.impl("hop", hop, "CompositeExplicitAutograd")
+
+        @torch.compiler.export_python(
+            path=self._tmp_path("earlyhop.py"), unsafe_reduce_overhead=True
+        )
+        def run(inp, *, out=None):
+            return (torch.ops.precompile_earlyhop.hop(inp * 2.0).sum(dim=1) * 3.0).cos()
+
+        x = make_tensor((32, 32), device=device, dtype=torch.float32)
+        donor = torch.empty_like(run(x))
+        run(x, out=(donor,))  # the recording call: re-points scratch while it runs
+        with self.assertRaisesRegex(PrecompileError, "no longer matches the request"):
+            run(x, out=(donor,))
+
+    @unittest.skipUnless(
+        TEST_CUDA and torch.cuda.device_count() >= 2, "needs two CUDA devices"
+    )
+    def test_served_buffer_device_index_change_is_caught(self, device):
+        # The index, not just the type: empty_strided_cuda encodes only "cuda", so a
+        # check derived from the allocator name would pass a cuda:1 buffer to a kernel
+        # built for cuda:0. Weakening the clause to a device-TYPE comparison is a
+        # plausible simplification that this is the only test to reject.
+        if torch.device(device).type != "cuda":
+            self.skipTest("the two devices have to be two CUDA devices")
+        lib = self._library("precompile_ordinalhop")
+        lib.define("hop(Tensor x) -> Tensor")
+        state = {}
+
+        def hop(x):
+            if "donor" in state:
+                donor = state.pop("donor")
+                donor.data = torch.empty_strided(
+                    donor.shape, donor.stride(), dtype=donor.dtype, device="cuda:1"
+                )
+            return x.clone()
+
+        lib.impl("hop", hop, "CompositeExplicitAutograd")
+
+        @torch.compiler.export_python(
+            path=self._tmp_path("ordinalhop.py"), unsafe_reduce_overhead=True
+        )
+        def run(inp, *, out=None):
+            return (torch.ops.precompile_ordinalhop.hop(inp).sum(dim=1) * 2.0).cos()
+
+        x = make_tensor((32, 32), device="cuda:0", dtype=torch.float32)
+        expected = run(x).clone()
+        donor = torch.empty_like(expected)
+        self.assertEqual(run(x, out=(donor,)), expected)
+
+        state["donor"] = donor
+        with self.assertRaisesRegex(PrecompileError, "no longer matches the request"):
+            run(x, out=(donor,))
+
+    @unittest.skipUnless(TEST_CUDA, "needs a second device to re-point an output onto")
+    def test_donated_output_repointed_during_recording_is_refused(self, device):
+        # The donated slot's expected device has to come from the allocation record too.
+        # Read off the produced output it is read after the recording graph ran, so an
+        # opaque op that re-points a buffer which BECOMES an output poisons the
+        # expectation itself and every later call compares wrong to wrong.
+        other = "cpu" if torch.device(device).type == "cuda" else "cuda"
+        lib = self._library("precompile_tailhop")
+        lib.define("tail(Tensor x) -> Tensor")
+
+        def tail(x):
+            # returns its own input, so the artifact's output IS this slot buffer, and
+            # re-points it last so the call still completes
+            x.data = torch.empty_strided(
+                x.shape, x.stride(), dtype=x.dtype, device=other
+            )
+            return x
+
+        lib.impl("tail", tail, "CompositeExplicitAutograd")
+        lib.impl("tail", lambda x: torch.empty_like(x), "Meta")
+
+        @torch.compiler.export_python(
+            path=self._tmp_path("tailhop.py"), unsafe_reduce_overhead=True
+        )
+        def run(inp, *, out=None):
+            return torch.ops.precompile_tailhop.tail(inp * 2.0)
+
+        x = make_tensor((8,), device=device, dtype=torch.float32)
+        first = run(x)
+        self.assertEqual(first.device.type, other)  # the op really did re-point it
+        # A donor matching the POISONED output is what a caller would naturally build.
+        # It must be refused, so no poisoned plan is ever committed.
+        with self.assertRaisesRegex(
+            PrecompileError, "out\\[0\\] must be a plain Tensor"
+        ):
+            run(x, out=(torch.empty_like(first),))
+
+    def test_artifact_does_not_bake_the_capture_thread_count(self, device):
+        # Inductor sizes a CPU reduction's per-thread accumulator array at codegen time
+        # when the capturing process's thread count equals os.cpu_count(), while still
+        # emitting a team whose size is decided at run time. Replaying under a larger
+        # OMP team then indexes past the end -- a SIGSEGV on the SAME machine, reachable
+        # by one torch.set_num_threads() call, which no part of the artifact contract
+        # covers. Capture runs in a subprocess because it has to change a process-global
+        # thread count, and the invariant is asserted on the emitted source rather than
+        # by replaying: replaying a regression is a crash, which in-process would abort
+        # the interpreter and hide every later test, and out-of-process needs a second
+        # compile that made this test load-sensitive.
+        if torch.device(device).type != "cpu":
+            self.skipTest("the baked array is CPU reduction codegen")
+        path = self._tmp_path("threads.py")
+        code = textwrap.dedent(
+            f"""
+            import os, torch
+            torch.set_num_threads(os.cpu_count())
+            run = torch.compiler.export_python(path={path!r})(lambda a: a.sum())
+            run(torch.randn(1 << 20))
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, timeout=600
+        )
+        self.assertEqual(
+            proc.returncode, 0, f"{proc.returncode}\n{proc.stderr[-2000:]}"
+        )
+        with open(path, encoding="utf-8") as f:
+            source = f.read()
+        # A team-sized array is written as e.g. tmp_acc0_arr[384]; with dynamic_threads
+        # pinned it sizes itself from omp_get_max_threads() at run time instead.
+        baked = re.findall(r"_arr\[(\d+)\]", source)
+        self.assertEqual(baked, [], f"artifact bakes a fixed per-thread array: {baked}")
+
+    def test_subclass_input_dtype_and_device_are_still_guarded(self, device):
+        # A wrapper subclass's outer SHAPE is not the dense shape the artifact bakes, so
+        # it is deliberately not stamped -- but the driver skipped dtype and device on
+        # the same condition, and those are well defined. A float64 subclass then reached
+        # a graph built for float32 and came back as reinterpreted bytes with no error.
+        def fn(x):
+            return x * 2 + 1
+
+        run = torch.compiler.export_python(path=self._tmp_path("sub_guard.py"))(fn)
+        base = make_tensor((4,), device=device, dtype=torch.float32)
+        run(TwoTensor(base, base.clone()))
+
+        same = make_tensor((4,), device=device, dtype=torch.float32)
+        self.assertEqual(run(TwoTensor(same, same.clone())).a, fn(same))
+
+        wide = make_tensor((4,), device=device, dtype=torch.float64)
+        with self.assertRaisesRegex(PrecompileError, "dtype"):
+            run(TwoTensor(wide, wide.clone()))
+
+        if TEST_CUDA:
+            elsewhere = "cpu" if torch.device(device).type == "cuda" else "cuda"
+            moved = make_tensor((4,), device=elsewhere, dtype=torch.float32)
+            with self.assertRaisesRegex(PrecompileError, "device"):
+                run(TwoTensor(moved, moved.clone()))
+
+    def test_indented_comment_does_not_stop_the_stamp_reader(self, device):
+        # The documented rule is that the reader stops at the first NON-COMMENT line. An
+        # indented comment is still a comment, but it ended the scan -- silently turning
+        # off every stamp below it, which is the degradation mode the design reserves
+        # for a stamp actually being deleted.
+        def fn(a, b):
+            a.add_(1.0)
+            return b * 10
+
+        path = self._tmp_path("indented.py")
+        wrapped = torch.compiler.export_python(path=path)(fn)
+
+        def arena():
+            return torch.zeros(8, device=device)
+
+        base = arena()
+        wrapped(base[0:4], base[2:6])
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines(True)
+        lines.insert(1, "    # a note a human might indent\n")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("".join(lines))
+
+        # the duplicate stamp lives below the inserted line; it must still be read
+        repeated = arena()[0:4]
+        with self.assertRaisesRegex(PrecompileError, "repeat tensor objects"):
+            torch.compiler.export_python(path=path)(fn)(repeated, repeated)
+
+    def test_pathological_version_stamp_warns_rather_than_raising(self, device):
+        # torch.__version__ is a TorchVersion, whose __eq__ PEP-440-parses the operand
+        # and re-raises anything that is not InvalidVersion, so a stamp of enough digits
+        # took the whole load path down with a ValueError -- permanently, on every call.
+        # A mangled stamp is a hand-edit like any other and must degrade to a warning.
+        path = self._tmp_path("bigversion.py")
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+
+        def fn(inp):
+            return inp + 1
+
+        torch.compiler.export_python(path=path)(fn)(x)
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines(True)
+        lines[0] = f"# torch.compiler.export_python torch-version: '{'9' * 4400}'\n"
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("".join(lines))
+
+        self.assertEqual(torch.compiler.export_python(path=path)(fn)(x), fn(x))
+
+    def test_capture_does_not_force_grad_enabled(self, device):
+        # Capture used to wrap the trace in enable_grad() on the theory that the forward
+        # graph is the same either way. It is not: fn can read torch.is_grad_enabled()
+        # and branch, so forcing the flag baked the wrong branch on the very FIRST call,
+        # in the capturing process, with no cross-process skew involved.
+        seen = []
+
+        def fn(inp):
+            seen.append(torch.is_grad_enabled())
+            return inp * 2
+
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+        with torch.no_grad():
+            torch.compiler.export_python(
+                path=self._tmp_path("gradmode_off.py"), backend="eager"
+            )(fn)(x)
+        self.assertEqual(seen, [False])
+
+        seen.clear()
+        torch.compiler.export_python(
+            path=self._tmp_path("gradmode_on.py"), backend="eager"
+        )(fn)(x)
+        self.assertEqual(seen, [True])
+
+    def test_ambient_global_state_is_stamped_and_checked(self, device):
+        # The generated code resolves these once, at capture, and bakes the answer: a
+        # factory op with no dtype= takes the default dtype then, and inductor picks a
+        # deterministic or an atomic lowering from the determinism flag. The artifact
+        # never re-reads either, so without a stamp a process that changes one silently
+        # gets capture's answer.
+        def fn(inp):
+            return inp + torch.ones(4, device=device)
+
+        path = self._tmp_path("globals.py")
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+        torch.compiler.export_python(path=path)(fn)(x)
+
+        with self.assertRaisesRegex(PrecompileError, "default_dtype"):
+            with _default_dtype(torch.float64):
+                torch.compiler.export_python(path=path)(fn)(x)
+
+        # Determinism is one-way: capture OFF and call ON means the artifact keeps a
+        # lowering the caller asked not to run, so that raises...
+        with self.assertRaisesRegex(PrecompileError, "deterministic"):
+            with _deterministic(True):
+                torch.compiler.export_python(path=path)(fn)(x)
+
+        # ...while capture ON and call OFF is conservative and must be allowed.
+        strict_path = self._tmp_path("globals_strict.py")
+        with _deterministic(True):
+            torch.compiler.export_python(path=strict_path)(fn)(x)
+        self.assertEqual(torch.compiler.export_python(path=strict_path)(fn)(x), fn(x))
+
+    @unittest.skipUnless(TEST_CUDA, "needs a device the inputs do not live on")
+    def test_autocast_stamp_covers_devices_only_the_graph_touches(self, device):
+        # Keying the stamp on the INPUT devices alone recorded [] for a graph whose
+        # inputs are on one device and whose matmuls run on another, so the check passed
+        # in both processes while the kernels had been built for autocast dtypes.
+        if torch.device(device).type != "cpu":
+            self.skipTest("the point is inputs on cpu and compute on the accelerator")
+
+        def fn(inp):
+            return (inp.cuda() @ inp.cuda().t()).cpu()
+
+        path = self._tmp_path("autocast_graph.py")
+        x = make_tensor((8, 8), device="cpu", dtype=torch.float32)
+        run = torch.compiler.export_python(path=path)(fn)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            run(x)
+            run(x)
+        with open(path, encoding="utf-8") as f:
+            stamp = next(l for l in f if "autocast:" in l)
+        self.assertIn("cuda", stamp)
+        with self.assertRaisesRegex(PrecompileError, "autocast"):
+            run(x)  # outside the region the kernels were built for
+
+        # The case the input-only filter existed to protect still works: a pure-CPU
+        # helper first called inside a CUDA autocast region is not locked to it.
+        def cpu_only(inp):
+            return inp.sin() + 1
+
+        helper = torch.compiler.export_python(path=self._tmp_path("cpu_only.py"))(
+            cpu_only
+        )
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            helper(x)
+        self.assertEqual(helper(x), cpu_only(x))
+
+    def test_meta_module_tensor_does_not_crash_the_autocast_stamp(self, device):
+        # autocast does not model every device an input can live on, and a module can
+        # carry a meta tensor it never reads (deferred init). Asking it about one raised
+        # a bare C++ RuntimeError from inside stamp emission, so nothing was ever
+        # published and every call re-paid the whole capture.
+        class DeferredInit(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(4, 4, device=device)
+                self.register_buffer("proto", torch.empty(4, device="meta"))
+                self.spare = torch.nn.Parameter(torch.empty(4, device="meta"))
+
+            def forward(self, inp):
+                return self.linear(inp)
+
+        mod = DeferredInit()
+        x = make_tensor((2, 4), device=device, dtype=torch.float32)
+        path = self._tmp_path("deferred.py")
+        run = torch.compiler.export_python(path=path)(lambda m, t: m(t))
+        self.assertEqual(run(mod, x), mod(x))
+        self.assertTrue(os.path.exists(path))  # published, so no capture is re-paid
+        self.assertEqual(run(mod, x), mod(x))  # and the loaded artifact runs too
+
+    def test_overlap_sweep_matches_the_pairwise_predicate(self, device):
+        # _input_overlaps sweeps sorted byte spans instead of running _shares_memory
+        # over every pair; the two must agree exactly, including the shapes that leave
+        # the sweep and fall back to the pairwise path.
+        from torch.compiler._export_python import _input_overlaps, _shares_memory
+
+        arena = make_tensor((32,), device=device, dtype=torch.float32)
+        other = make_tensor((32,), device=device, dtype=torch.float32)
+        cases = [
+            [arena[0:20], arena[10:30], arena[20:32], arena[24:32]],  # a chain
+            [arena[i:] for i in range(5)],  # a clique
+            [arena[:8], other[:8], arena[8:16], other[8:16]],  # two disjoint groups
+            [arena[:4], torch.empty(0, device=device), arena[2:6]],
+            [arena[:4], torch.randn(4, device="meta"), arena[2:6]],
+            [arena[:4], arena.to_sparse(), other[:4]],  # unresolvable: pairwise path
+            [TwoTensor(arena[:4], other[:4]), arena[2:6], other[6:10]],
+            # One wrapper whose two leaves overlap EACH OTHER: the only shape that
+            # can produce a bogus self-pair out of the sweep.
+            [TwoTensor(arena[:4], arena[:4]), other[:4]],
+            # Wrappers misreporting their device. The INDEX lie alone does not pin the
+            # sweep's keying -- the key it replaced was (wrapper device TYPE, leaf
+            # device), which already handled that axis -- so the TYPE lie has to be here
+            # too, or reverting the key passes while the sweep and the predicate
+            # demonstrably disagree.
+            [
+                _MisreportedDevice(arena[:4], _lying_device(device)),
+                arena[2:6],
+                other[:4],
+            ],
+            [arena[:4], _MisreportedDevice(arena[2:6], _lying_device(device))],
+            [
+                _MisreportedDevice(arena[:4], _type_lying_device(device)),
+                arena[2:6],
+                other[:4],
+            ],
+            [arena[:4], _MisreportedDevice(arena[2:6], torch.device("meta"))],
+            [arena.as_strided((4,), (7,)), arena[20:24], arena[28:32]],
+            [],
+            [arena],
+        ]
+        for tensors in cases:
+            pairwise = [
+                [i, j]
+                for i in range(len(tensors))
+                for j in range(i + 1, len(tensors))
+                if _shares_memory(tensors[i], tensors[j])
+            ]
+            self.assertEqual(_input_overlaps(None, tensors), pairwise)
+
+    def test_recording_call_returns_the_validated_donors(self, device):
+        # The recording call hands back the caller's own buffers, in order. Equal-valued
+        # copies would satisfy every value assertion here and still strand a caller that
+        # kept a reference to what it passed in, which is the whole point of out=.
+        @torch.compiler.export_python(
+            path=self._tmp_path("record_returns.py"), unsafe_reduce_overhead=True
+        )
+        def run(inp, *, out=None):
+            return inp.sin() + 1, inp.cos()
+
+        x = make_tensor((8, 8), device=device, dtype=torch.float32)
+        donors = (torch.empty_like(x), torch.empty_like(x))
+        returned = run(x, out=donors)  # the FIRST out= call: the recording path
+        self.assertIs(returned[0], donors[0])
+        self.assertIs(returned[1], donors[1])
+        self.assertEqual(returned[0], x.sin() + 1)
+        self.assertEqual(returned[1], x.cos())
+
+    def test_version_stamp_written_before_the_repr_change_still_warns(self, device):
+        # Artifacts already committed carry a bare, unquoted version. literal_eval
+        # rejects those, and treating that as "hand-edited, stay silent" would disable
+        # the skew warning for exactly the artifacts it exists to protect.
+        path = self._tmp_path("old_stamp.py")
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+
+        def build():
+            @torch.compiler.export_python(path=path, backend="eager")
+            def run(inp):
+                return inp + 1
+
+            return run
+
+        build()(x)
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines(True)
+        tag = "# torch.compiler.export_python torch-version: "
+        self.assertTrue(lines[0].startswith(tag))
+        lines[0] = tag + "0.0.0-bogus\n"  # pre-repr encoding, unquoted
+        with open(path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+        with self.assertLogs("torch.compiler._export_python", "WARNING") as logs:
+            build()(x)
+        self.assertTrue(any("0.0.0-bogus" in m for m in logs.output), logs.output)
+
+    def test_input_aliasing_a_module_buffer_is_guarded(self, device):
+        # A tensor argument that aliases a module buffer must enter the overlap stamp.
+        # AOTAutograd dedups the two into one graph slot, so an artifact captured with
+        # that alias computes -- and on the eager backend mutates -- the wrong thing
+        # when the runtime call passes independent tensors.
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("b", torch.zeros(4, device=device))
+
+        def fn(m, x):
+            m.b.add_(1.0)
+            return m.b + x * 2
+
+        captured = M()
+        aliased = torch.compiler.export_python(
+            path=self._tmp_path("module_alias.py"),
+            backend="eager",
+            example_inputs=(captured, captured.b),
+        )(fn)
+        aliased(captured, captured.b)
+
+        fresh = M()
+        independent = torch.zeros(4, device=device)
+        with self.assertRaisesRegex(PrecompileError, "do not share memory"):
+            aliased(fresh, independent)
+        # ...and the rejected call left the caller's tensor alone.
+        self.assertEqual(independent, torch.zeros(4, device=device))
+
+    def test_served_buffer_is_checked_against_the_allocation_request(self, device):
+        # _alloc is handed the generated code's actual request. A donor re-pointed after
+        # validation (an opaque op calling set_) must be caught there, or a kernel writes
+        # through baked sizes into a smaller allocation.
+        lib = self._library("precompile_repoint")
+        lib.define("repoint(Tensor x) -> Tensor")
+        state = {}
+
+        def repoint(x):
+            if "donor" in state:
+                state.pop("donor").set_(torch.empty(4, 4, device=device))
+            return x.clone()
+
+        lib.impl("repoint", repoint, "CompositeExplicitAutograd")
+
+        @torch.compiler.export_python(
+            path=self._tmp_path("repoint.py"), unsafe_reduce_overhead=True
+        )
+        def run(inp, w, *, out=None):
+            return (torch.ops.precompile_repoint.repoint(inp) @ w).relu()
+
+        n = 32
+        x = make_tensor((n, n), device=device, dtype=torch.float32)
+        w = make_tensor((n, n), device=device, dtype=torch.float32)
+        expected = run(x, w).clone()
+        donor = torch.empty_like(expected)
+        self.assertEqual(run(x, w, out=(donor,)), expected)
+
+        state["donor"] = donor
+        with self.assertRaisesRegex(PrecompileError, "no longer matches the request"):
+            run(x, w, out=(donor,))
+
+    def test_out_rejects_a_donor_overlapping_an_input_via_another_storage(self, device):
+        import numpy as np
+
+        @torch.compiler.export_python(
+            path=self._tmp_path("np_overlap.py"), unsafe_reduce_overhead=True
+        )
+        def run(inp, *, out=None):
+            return inp.sin() + 1
+
+        arr = np.zeros(256, dtype=np.float32)
+        x = torch.from_numpy(arr[0:128])
+        overlapping = torch.from_numpy(arr[64:192])
+        run(x)  # materialize
+        with self.assertRaisesRegex(PrecompileError, "overlaps"):
+            run(x, out=(overlapping,))
+
+    def test_replay_rejects_a_wrong_shaped_donor(self, device):
+        # The shape clause exists for the REPLAY path: the recording path has an
+        # independent donor.copy_ that catches a shape mismatch on its own, so a test
+        # that only records never exercises it. The donor's storage is large enough
+        # that a regression is a wrong answer rather than an out-of-bounds write.
+        @torch.compiler.export_python(
+            path=self._tmp_path("replay_shape.py"), unsafe_reduce_overhead=True
+        )
+        def run(inp, *, out=None):
+            return inp.sin() + 1
+
+        x = make_tensor((8, 8), device=device, dtype=torch.float32)
+        expected = x.sin() + 1
+        donor = torch.empty_like(expected)
+        self.assertEqual(run(x, out=(donor,)), expected)
+        misshaped = torch.empty(64, device=device).as_strided((7, 8), (8, 1))
+        with self.assertRaisesRegex(PrecompileError, "must be a plain Tensor"):
+            run(x, out=(misshaped,))
+        self.assertEqual(run(x, out=(donor,)), expected)
+
+    def test_replay_rechecks_a_donor_mutated_in_place(self, device):
+        # The recheck cannot be memoized on donor identity: set_() and resize_() change
+        # metadata under a stable id(), which is what makes the same object unsafe.
+        @torch.compiler.export_python(
+            path=self._tmp_path("mutated_donor.py"), unsafe_reduce_overhead=True
+        )
+        def run(inp, *, out=None):
+            return inp.sin() + 1
+
+        x = make_tensor((8, 8), device=device, dtype=torch.float32)
+        donor = torch.empty_like(x.sin() + 1)
+        run(x, out=(donor,))
+        donor.set_(torch.empty(4, 4, device=device))  # same object, new metadata
+        with self.assertRaisesRegex(PrecompileError, "must be a plain Tensor"):
+            run(x, out=(donor,))
+
+    def test_donated_sequence_is_snapshotted(self, device):
+        # _alloc dereferences the donated sequence long after _check_donor ran, so
+        # holding the caller's live list makes the whole donor check a TOCTOU: an
+        # opaque op can swap in a donor that was never validated and the kernel writes
+        # straight through it.
+        lib = self._library("precompile_swap")
+        lib.define("swap(Tensor x) -> Tensor")
+        state = {}
+
+        def swap(x):
+            if "out_list" in state:
+                state["out_list"][0] = state["smuggled"]
+                state.pop("out_list")
+            return x.clone()
+
+        lib.impl("swap", swap, "CompositeExplicitAutograd")
+
+        @torch.compiler.export_python(
+            path=self._tmp_path("toctou.py"), unsafe_reduce_overhead=True
+        )
+        def run(inp, w, *, out=None):
+            return (torch.ops.precompile_swap.swap(inp) @ w).relu()
+
+        x = make_tensor((8, 8), device=device, dtype=torch.float32)
+        w = make_tensor((8, 8), device=device, dtype=torch.float32)
+        expected = run(x, w).clone()
+        good = torch.empty_like(expected)
+        self.assertEqual(run(x, w, out=(good,)), expected)
+
+        smuggled = torch.empty_like(expected)
+        out_list = [good]
+        state.update(out_list=out_list, smuggled=smuggled)
+        run(x, w, out=out_list)
+        # The validated donor is the one written; the swapped-in tensor is untouched.
+        self.assertEqual(good, expected)
+        self.assertFalse(torch.equal(smuggled, expected))
+
+    def test_donating_call_releases_the_caller_tensors(self, device):
+        # The pool must not keep the caller's out= tensors alive for the artifact's
+        # lifetime; on CUDA that pins device memory indefinitely.
+        @torch.compiler.export_python(
+            path=self._tmp_path("donor_release.py"), unsafe_reduce_overhead=True
+        )
+        def run(inp, *, out=None):
+            return inp.sin() + 1
+
+        x = make_tensor((8, 8), device=device, dtype=torch.float32)
+        donor = torch.empty_like(x.sin() + 1)
+        run(x, out=(donor,))
+        run(x, out=(donor,))
+        ref = weakref.ref(donor)
+        del donor
+        gc.collect()
+        self.assertIsNone(ref())
+
+    def test_donating_into_slices_of_one_arena(self, device):
+        @torch.compiler.export_python(
+            path=self._tmp_path("arena_out.py"), unsafe_reduce_overhead=True
+        )
+        def two(x, *, out=None):
+            return x.sin(), x.cos()
+
+        x = make_tensor((64,), device=device, dtype=torch.float32)
+        expected = two(x)
+        arena = torch.empty(128, device=device)
+        two(x, out=(arena[:64], arena[64:]))
+        self.assertEqual(arena[:64], expected[0])
+        self.assertEqual(arena[64:], expected[1])
+
+    def test_dropping_the_aliasing_or_autocast_stamp_warns(self, device):
+        # The docstring promises a warning for each dropped stamp; the module-training
+        # one warned and these two used to fall through in silence.
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+        for tag, name in (("input-overlap:", "alias"), ("autocast:", "autocast")):
+            path = self._tmp_path(f"drop_{name}.py")
+
+            def build():
+                @torch.compiler.export_python(path=path, backend="eager")
+                def run(a, b):
+                    return a + b
+
+                return run
+
+            build()(x, x)
+            with open(path, encoding="utf-8") as f:
+                lines = f.readlines()
+            kept = [line for line in lines if tag not in line]
+            self.assertEqual(len(kept), len(lines) - 1, f"{tag} stamp not found")
+            with open(path, "w", encoding="utf-8") as f:
+                f.writelines(kept)
+            with self.assertLogs("torch.compiler._export_python", "WARNING") as logs:
+                build()(x, x)
+            self.assertTrue(
+                any("carries no recorded" in m for m in logs.output), logs.output
+            )
+
+    def test_input_aliasing_is_guarded(self, device):
+        # Aliasing decides what an in-place mutation means and is baked into the graph
+        # with no runtime guard, so an artifact captured on aliased inputs computes --
+        # and mutates -- the wrong thing when they are distinct. torch.compile guards
+        # this and recompiles; the artifact cannot, so it must refuse.
+        def fn(a, b):
+            a.add_(b)
+            return a * 2
+
+        seed = torch.arange(4.0, device=device)
+        aliased = torch.compiler.export_python(
+            path=self._tmp_path("alias_capture.py"),
+            backend="eager",
+            example_inputs=(seed, seed),
+        )(fn)
+        a = torch.arange(4.0, device=device)
+        with self.assertRaisesRegex(PrecompileError, "do not share memory"):
+            aliased(a, torch.ones(4, device=device))
+        self.assertEqual(a, torch.arange(4.0, device=device))  # left untouched
+
+        # The mirror case: captured distinct, called aliased.
+        distinct = torch.compiler.export_python(
+            path=self._tmp_path("alias_distinct.py"), backend="eager"
+        )(fn)
+        b = torch.arange(4.0, device=device)
+        distinct(b, torch.ones(4, device=device))
+        c = torch.arange(4.0, device=device)
+        with self.assertRaisesRegex(PrecompileError, "do not share memory"):
+            distinct(c, c)
+
+    def test_autocast_state_is_guarded(self, device):
+        # Ambient autocast picks the dtypes the kernels were specialized for, and is
+        # invisible to make_fx's guards, so calling under a different autocast context
+        # silently returns the capture-time dtype.
+        @torch.compiler.export_python(
+            path=self._tmp_path("autocast.py"), backend="eager"
+        )
+        def run(a, b):
+            return a @ b
+
+        device_type = torch.device(device).type
+        x = make_tensor((8, 8), device=device, dtype=torch.float32)
+        self.assertEqual(run(x, x).dtype, torch.float32)
+        with self.assertRaisesRegex(PrecompileError, "autocast state does not match"):
+            with torch.autocast(device_type, torch.bfloat16):
+                run(x, x)
+
+    def test_out_grad_and_inference_donors_follow_eager(self, device):
+        # The rule is eager's, not the flag's: torch.add(..., out=leaf) is refused only
+        # with grad enabled, and an inference tensor only outside InferenceMode. Being
+        # stricter would ban donating a plain leaf that requires grad under no_grad, and
+        # ban out= from serving loops, where every buffer the loop owns is an inference
+        # tensor. It does not buy nn.Parameter donors: the exact-type test refuses those
+        # in every grad mode.
+        @torch.compiler.export_python(
+            path=self._tmp_path("out_grad_donor.py"), unsafe_reduce_overhead=True
+        )
+        def run(inp, *, out=None):
+            return inp.sin() + 1
+
+        x = make_tensor((8, 8), device=device, dtype=torch.float32)
+        expected = x.sin() + 1
+        with self.assertRaisesRegex(PrecompileError, "requires grad"):
+            run(x, out=(torch.empty_like(x).requires_grad_(True),))
+        with torch.no_grad():  # ...accepted here, exactly as eager's out= is
+            donor = torch.empty_like(x).requires_grad_(True)
+            self.assertEqual(run(x, out=(donor,)), expected)
+
+        with torch.inference_mode():
+            escaped = torch.empty_like(x)
+        with self.assertRaisesRegex(PrecompileError, "inference tensor"):
+            run(x, out=(escaped,))
+        with torch.inference_mode():  # ...accepted inside the block that allocated it
+            self.assertEqual(run(x, out=(torch.empty_like(x),)), expected)
+
+    def test_out_accepts_a_pinned_donor_for_a_pageable_output(self, device):
+        # Byte-compatible; only the reverse direction (pinned output, pageable donor)
+        # is unsafe, and that is covered on CUDA by the D2H case below.
+        if not TEST_CUDA or torch.device(device).type != "cpu":
+            self.skipTest("pinned host memory needs CUDA")
+
+        @torch.compiler.export_python(
+            path=self._tmp_path("pinned_donor.py"), unsafe_reduce_overhead=True
+        )
+        def run(inp, *, out=None):
+            return inp.sin() + 1
+
+        x = make_tensor((8, 8), device=device, dtype=torch.float32)
+        self.assertEqual(run(x, out=(torch.empty(8, 8, pin_memory=True),)), x.sin() + 1)
+
+    def test_out_rejects_a_pageable_donor_for_a_pinned_output(self, device):
+        if not TEST_CUDA or torch.device(device).type != "cuda":
+            self.skipTest("needs a D2H copy to produce a pinned output")
+
+        @torch.compiler.export_python(
+            path=self._tmp_path("pinned_out.py"), unsafe_reduce_overhead=True
+        )
+        def run(inp, *, out=None):
+            return inp.to("cpu", non_blocking=True)
+
+        x = make_tensor((1024,), device=device, dtype=torch.float32)
+        produced = run(x)
+        if not produced.is_pinned():
+            self.skipTest("this artifact does not allocate a pinned output")
+        with self.assertRaisesRegex(PrecompileError, "must be a plain Tensor"):
+            run(x, out=(torch.empty_strided(produced.shape, produced.stride()),))
+
+    def test_out_replay_rejects_stream_change(self, device):
+        if not TEST_CUDA or torch.device(device).type != "cuda":
+            self.skipTest("CUDA stream semantics")
+        path = self._tmp_path("out_stream.py")
+
+        @torch.compiler.export_python(path=path, unsafe_reduce_overhead=True)
+        def run(a, b, *, out=None):
+            return (a @ b).relu() @ b
+
+        a = make_tensor((64, 64), device=device, dtype=torch.float32)
+        b = make_tensor((64, 64), device=device, dtype=torch.float32)
+        donor = torch.empty_like(a)
+        run(a, b, out=(donor,))
+        torch.cuda.synchronize()
+        with torch.cuda.stream(torch.cuda.Stream()):
+            with self.assertRaisesRegex(PrecompileError, "same accelerator stream"):
+                run(a, b, out=(donor,))
+
+    def test_out_stream_tracking_includes_accelerator_inputs(self, device):
+        if not TEST_CUDA or torch.device(device).type != "cuda":
+            self.skipTest("CUDA stream semantics")
+
+        @torch.compiler.export_python(
+            path=self._tmp_path("out_d2h_stream.py"), unsafe_reduce_overhead=True
+        )
+        def run(inp, *, out=None):
+            return inp.to("cpu", non_blocking=True)
+
+        x = make_tensor((1024,), device=device, dtype=torch.float32)
+        expected = run(x)
+        donor = torch.empty_strided(
+            expected.shape,
+            expected.stride(),
+            dtype=expected.dtype,
+            device="cpu",
+            pin_memory=True,
+        )
+        run(x, out=(donor,))
+        torch.cuda.synchronize()
+        stream = torch.cuda.Stream()
+        try:
+            with self.assertRaisesRegex(PrecompileError, "same accelerator stream"):
+                with torch.cuda.stream(stream):
+                    run(x, out=(donor,))
+        finally:
+            stream.synchronize()
+
+    def test_out_rejects_special_allocator_provenance(self, device):
+        from torch.compiler._export_python import _BufferDonationPool
+
+        namespace = {}
+
+        def empty_strided_p2p(size, stride, dtype):
+            return torch.empty_strided(size, stride, dtype=dtype)
+
+        namespace["empty_strided_p2p"] = empty_strided_p2p
+        pool = _BufferDonationPool(namespace)
+
+        def call(_args):
+            return [namespace["empty_strided_p2p"]((4,), (1,), torch.float32)]
+
+        with self.assertRaisesRegex(PrecompileError, "memory provenance"):
+            pool.record(call, [], (torch.empty(4),))
+
+    def test_out_rejects_special_allocator_provenance_for_scratch(self, device):
+        # The provenance gate used to run only for slots that became outputs. A special
+        # allocation used as INTERMEDIATE scratch was pooled instead, and the plan's
+        # strong reference to it outlives the call -- for symmetric memory that pins the
+        # alloc_id and wedges later PLAIN calls, the one thing the pool promises not to
+        # touch.
+        from torch.compiler._export_python import _BufferDonationPool
+
+        namespace = {
+            "empty_strided_p2p": lambda size, stride, dtype: torch.empty_strided(
+                size, stride, dtype=dtype
+            ),
+            "empty_strided_cpu": lambda size, stride, dtype: torch.empty_strided(
+                size, stride, dtype=dtype
+            ),
+        }
+        pool = _BufferDonationPool(namespace)
+
+        def call(_args):
+            scratch = namespace["empty_strided_p2p"]((4,), (1,), torch.float32)
+            produced = namespace["empty_strided_cpu"]((4,), (1,), torch.float32)
+            produced.copy_(scratch)
+            return [produced]  # the p2p buffer is never returned
+
+        with self.assertRaisesRegex(
+            PrecompileError, "scratch buffer .* memory provenance"
+        ):
+            pool.record(call, [], (torch.empty(4),))
+
+    def test_donating_call_with_a_module_less_device_input(self, device):
+        # A meta argument owns no memory and binds to no stream, but it reached
+        # torch.get_device_module in the stream loop and died with a bare driver error
+        # three lines before the PrecompileError written for a device with no stream API.
+        path = self._tmp_path("moduleless.py")
+
+        @torch.compiler.export_python(path=path, unsafe_reduce_overhead=True)
+        def run(inp, spare, *, out=None):
+            return inp.sin() + 1
+
+        x = make_tensor((8,), device=device, dtype=torch.float32)
+        spare = torch.empty(4, device="meta")
+        expected = run(x, spare).clone()
+        donor = torch.empty_like(expected)
+        self.assertEqual(run(x, spare, out=(donor,)), expected)
+        self.assertEqual(run(x, spare, out=(donor,)), expected)
+
+    def test_donor_of_an_unstrided_layout_is_refused_not_raised_through(self, device):
+        # _check_donor's predicate and its message both read accessors that sparse and
+        # nested tensors do not define, so refusing one escaped as a raw ATen error --
+        # for nested, one that says "Please file an issue".
+        path = self._tmp_path("layouts.py")
+
+        @torch.compiler.export_python(path=path, unsafe_reduce_overhead=True)
+        def run(inp, *, out=None):
+            return inp.sin() + 1
+
+        x = make_tensor((4, 4), device=device, dtype=torch.float32)
+        run(x)
+        for donor, described in (
+            (torch.randn(4, 4, device=device).to_sparse(), "sparse_coo layout"),
+            (torch.randn(4, 4, device=device).to_sparse_csr(), "sparse_csr layout"),
+            (
+                torch.nested.nested_tensor(
+                    [torch.randn(4, device=device), torch.randn(4, device=device)]
+                ),
+                "nested Tensor",
+            ),
+        ):
+            # the message has to say what was wrong with it, not just that something was
+            with self.assertRaisesRegex(
+                PrecompileError, f"must be a plain Tensor.*{described}"
+            ):
+                run(x, out=(donor,))
+
+        # A subclass whose metadata matches must not print identically to what it is
+        # being refused against.
+        with self.assertRaisesRegex(PrecompileError, "got Parameter "):
+            run(x, out=(torch.nn.Parameter(torch.empty(4, 4, device=device)),))
+
+    def test_out_rejected_when_output_is_a_view(self, device):
+        # A reshaped output comes back as a view of a buffer rather than the buffer, so
+        # there is no allocation to redirect into the caller's tensor. Reject it by
+        # name instead of donating the wrong slot.
+        path = self._tmp_path("out_view.py")
+
+        @torch.compiler.export_python(path=path, unsafe_reduce_overhead=True)
+        def run(a, b, *, out=None):
+            return (a @ b).reshape(-1)
+
+        a = make_tensor((8, 8), device=device, dtype=torch.float32)
+        b = make_tensor((8, 8), device=device, dtype=torch.float32)
+        o = torch.empty_like(run(a, b))
+        with self.assertRaisesRegex(PrecompileError, "not a buffer the artifact"):
+            run(a, b, out=(o,))
+
+    def test_out_rejected_for_eager_backend(self, device):
+        # An eager artifact runs a bare graph, so it binds none of the allocators the
+        # donation contract needs; the rejection names the contract it failed.
+        run = self._rope_artifact(device, backend="eager", unsafe_reduce_overhead=True)
+        args = [
+            make_tensor((8, 8), device=device, dtype=torch.float32) for _ in range(3)
+        ]
+        o = torch.empty((8, 8), device=device, dtype=torch.float32)
+        with self.assertRaisesRegex(PrecompileError, r"empty_strided\* callables"):
+            run(*args, out=(o, o.clone()))
+
+    def test_allocator_prefix_matches_codegen_call_sites(self, device):
+        # Pins the codegen side of _ALLOCATOR_PREFIX: every allocator name inductor can
+        # emit for a buffer starts with it. The donation plan is replayed by allocation
+        # ORDER, so an allocator the prefix missed would silently desync it rather than
+        # fail, which is why this is checked against the emitter rather than against a
+        # single generated artifact (whose device coverage is whatever the host has).
+        from torch._inductor.codegen.wrapper import PythonWrapperCodegen
+        from torch.compiler._export_python import _ALLOCATOR_PREFIX
+
+        source = inspect.getsource(PythonWrapperCodegen.make_allocation)
+        callees = re.findall(r"\{name\} = ([\w{}.]+)\(", source)
+        self.assertTrue(callees, "make_allocation no longer emits '{name} = alloc('")
+        for callee in callees:
+            if callee == "tracked_empty_strided":
+                # test_configs.track_memory_lifecycle routes EVERY allocation through
+                # this one name, so the pool intercepts none of them and the recording
+                # call raises instead of serving a partially donated plan.
+                continue
+            self.assertTrue(
+                callee.startswith(_ALLOCATOR_PREFIX),
+                f"inductor emits buffer allocations through {callee}, which "
+                f"_ALLOCATOR_PREFIX ({_ALLOCATOR_PREFIX!r}) does not match; "
+                "_BufferDonationPool would not intercept it",
+            )
+
+    def test_pool_intercepts_every_artifact_allocator(self, device):
+        # Runtime side of the same invariant: whatever allocators an artifact actually
+        # binds, the pool must wrap all of them. The bound set is found by identity
+        # against the real allocator functions, not by name, so a rename that escapes
+        # _ALLOCATOR_PREFIX fails here.
+        from torch.compiler._export_python import _ALLOCATOR_PREFIX, _BufferDonationPool
+
+        path = self._tmp_path("alloc_prefix.py")
+
+        @torch.compiler.export_python(path=path, backend="inductor")
+        def run(a, b):
+            return a * 2 + b
+
+        x = make_tensor((8, 8), device=device, dtype=torch.float32)
+        run(x, x)
+
+        guards = torch._C._dynamo.guards
+        real = [v for n, v in vars(guards).items() if n.startswith("_empty_strided")]
+        real.append(torch.empty_strided)
+        from torch._precompile import _make_inlined_forward
+
+        with open(path, encoding="utf-8") as f:
+            ns = _make_inlined_forward(f.read(), warn=False).__globals__
+        bound = sorted(n for n, v in ns.items() if any(v is r for r in real))
+        self.assertTrue(bound, "the artifact binds no inductor buffer allocator")
+
+        wrapped = dict(ns)
+        _BufferDonationPool(wrapped)
+        for name in bound:
+            self.assertIsNot(
+                wrapped[name],
+                ns[name],
+                f"the artifact allocates through {name}, which _ALLOCATOR_PREFIX "
+                f"({_ALLOCATOR_PREFIX!r}) does not match, so the donation plan would "
+                "be recorded and replayed with that allocator's buffers missing",
+            )
+
+
+instantiate_device_type_tests(TestExportPython, globals())
 
 
 if __name__ == "__main__":

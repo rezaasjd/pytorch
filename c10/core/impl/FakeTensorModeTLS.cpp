@@ -19,18 +19,6 @@ void FakeTensorModeTLS::create_state(std::shared_ptr<FakeTensorMode> state) {
   fakeTensorModeState = std::move(state);
 }
 
-void FakeTensorModeTLS::activate() {
-  TORCH_INTERNAL_ASSERT(
-      fakeTensorModeState, "activate() called with no FakeTensorMode state");
-  tls_set_dispatch_key_included(DispatchKey::Fake, true);
-}
-
-void FakeTensorModeTLS::deactivate() {
-  TORCH_INTERNAL_ASSERT(
-      fakeTensorModeState, "deactivate() called with no FakeTensorMode state");
-  tls_set_dispatch_key_included(DispatchKey::Fake, false);
-}
-
 std::shared_ptr<FakeTensorMode> FakeTensorModeTLS::get_state() {
   return fakeTensorModeState;
 }
@@ -38,6 +26,27 @@ std::shared_ptr<FakeTensorMode> FakeTensorModeTLS::get_state() {
 void FakeTensorModeTLS::reset_state() {
   fakeTensorModeState = nullptr;
   tls_set_dispatch_key_included(DispatchKey::Fake, false);
+}
+
+static thread_local bool fakeInKernelInvocation = false;
+
+bool in_kernel_invocation() {
+  return fakeInKernelInvocation;
+}
+
+void set_in_kernel_invocation(bool value) {
+  fakeInKernelInvocation = value;
+}
+
+static FakeDeviceIndexResolver fakeDeviceIndexResolver = nullptr;
+
+void setFakeDeviceIndexResolver(FakeDeviceIndexResolver fn) {
+  fakeDeviceIndexResolver = fn;
+}
+
+DeviceIndex resolveFakeDeviceIndex(DeviceType type) {
+  return fakeDeviceIndexResolver ? fakeDeviceIndexResolver(type)
+                                 : static_cast<DeviceIndex>(0);
 }
 
 } // namespace c10::impl

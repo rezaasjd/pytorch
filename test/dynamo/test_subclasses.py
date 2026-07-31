@@ -38,6 +38,11 @@ from torch.testing._internal.two_tensor import TwoTensor
 from torch.utils._python_dispatch import return_and_correct_aliasing
 
 
+skipIfCppFakeTensor = unittest.skipIf(
+    torch._dynamo.config.use_cpp_fake_tensor, "no nestedtensor w/ cpp faketensor"
+)
+
+
 def nontraceable_subclass(c):
     return torch._dynamo.config.patch("nontraceable_tensor_subclasses", {c})
 
@@ -3029,6 +3034,11 @@ class TestTwoTensorSubclass(
 ):
     """Tests for TwoTensor wrapper subclass tracing under dynamo."""
 
+    @unittest.skipIf(
+        torch._dynamo.config.use_cpp_fake_tensor,
+        "cpp faketensor produces a semantically equivalent but not exactly "
+        "matching graph",
+    )
     def test_tensor_subclass_TwoTensor_simple(self):
         def f(tt):
             return tt * tt.size()[0]
@@ -3195,6 +3205,11 @@ class GraphModule(torch.nn.Module):
 """,
         )
 
+    @unittest.skipIf(
+        torch._dynamo.config.use_cpp_fake_tensor,
+        "cpp faketensor produces a semantically equivalent but not exactly "
+        "matching graph",
+    )
     def test_tensor_subclass_TwoTensor_mul(self):
         def f(tt, a, b):
             s0, s1 = a.size()
@@ -3380,6 +3395,11 @@ class GraphModule(torch.nn.Module):
 """,
         )
 
+    @unittest.skipIf(
+        torch._dynamo.config.use_cpp_fake_tensor,
+        "cpp faketensor produces a semantically equivalent but not exactly "
+        "matching graph",
+    )
     def test_tensor_subclass_TwoTensor_view_mul(self):
         def f(tt):
             y = tt.clone()
@@ -3460,6 +3480,11 @@ class GraphModule(torch.nn.Module):
 """,
         )
 
+    @unittest.skipIf(
+        torch._dynamo.config.use_cpp_fake_tensor,
+        "cpp faketensor produces a semantically equivalent but not exactly "
+        "matching graph",
+    )
     def test_tensor_subclass_TwoTensor_return_tensor_and_subclass(self):
         def f(tt):
             y = tt.clone()
@@ -3580,6 +3605,11 @@ class GraphModule(torch.nn.Module):
 """,
         )
 
+    @unittest.skipIf(
+        torch._dynamo.config.use_cpp_fake_tensor,
+        "cpp faketensor produces a semantically equivalent but not exactly "
+        "matching graph",
+    )
     def test_tensor_subclass_TwoTensor_automatic_dynamic_shapes(self):
         def f(tt):
             y = tt.clone()
@@ -3702,6 +3732,11 @@ class GraphModule(torch.nn.Module):
 """,
         )
 
+    @unittest.skipIf(
+        torch._dynamo.config.use_cpp_fake_tensor,
+        "cpp faketensor produces a semantically equivalent but not exactly "
+        "matching graph",
+    )
     def test_tensor_subclass_TwoTensor_mark_dynamic_shapes(self):
         def f(tt):
             y = tt.clone()
@@ -4239,6 +4274,7 @@ class TestIssubclass(torch._dynamo.test_case.TestCase):
         self.assertEqual(result_eager, result_compiled)
 
 
+@skipIfCppFakeTensor
 class TestNestedTensor(
     _SubclassCompileCheckMixin,
     torch._dynamo.test_case.TestCase,

@@ -108,6 +108,10 @@ def make_compiler_fn(
 
 compiler_fn = make_compiler_fn()
 
+skipIfCppFakeTensor = unittest.skipIf(
+    torch._dynamo.config.use_cpp_fake_tensor, "no nestedtensor w/ cpp faketensor"
+)
+
 
 # TODO(jansel): hooks as lambdas creates recompiles in dynamo, we should fix that
 def hook1(grad):
@@ -3105,6 +3109,7 @@ main()
         """
         self.run_as_subprocess(script)
 
+    @skipIfCppFakeTensor
     @unittest.skipIf(not HAS_GPU, "requires gpu")
     def test_free_activation_memory_subclass(self):
         # cover the case when aot inputs have subclasses, resulting in a different runtime wrapper

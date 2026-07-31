@@ -515,6 +515,14 @@ class HigherOrderOperator(OperatorBase, abc.ABC):
 
         final_key = resolve_key(self, dispatch_key)
 
+        if final_key not in self.py_kernels and final_key == DispatchKey.Fake:
+            cpp_fake_mode = torch._C._current_cpp_fake_tensor_mode()
+            fake_handler = self.python_key_table.get(
+                torch._subclasses.fake_tensor.FakeTensorMode
+            )
+            if cpp_fake_mode is not None and fake_handler is not None:
+                return fake_handler(cpp_fake_mode, *args, **kwargs)
+
         # This can current fail due to backend fallbacks.  You just have to
         # register them by hand for HigherOrderOperator.
         if final_key not in self.py_kernels:

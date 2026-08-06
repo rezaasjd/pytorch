@@ -1612,6 +1612,41 @@ def _optimize_catch_errors(
     )
 
 
+# Hooks that have already fired. Dedup keys on the _dynamo_backend_init
+# callable itself, so init runs once per hook per process -- across
+# compile-site reuse, the compiled_autograd rebuild path, and force_backend.
+# reset() intentionally does not clear this: native-library init is
+# process-global, not cache state.
+_initialized_backends: weakref.WeakSet[Any] = weakref.WeakSet()
+_init_lock = threading.Lock()
+
+
+def _maybe_fire_backend_init(backend: Callable[..., Any]) -> None:
+    # Unwrap _TorchCompileWrapper (a fresh instance per torch.compile).
+    inner = (
+        backend.compiler_fn
+        if isinstance(backend, torch._TorchCompileWrapper)
+        else backend
+    )
+    backend_init = getattr(inner, "_dynamo_backend_init", None)
+    if backend_init is None:
+        return
+    # Dedup key: __self__ for bound methods (per-instance for instance methods,
+    # per-class for classmethods), else the callable itself. Keying on __self__
+    # (not the transient bound-method object) keeps the WeakSet entry alive via
+    # its owner, and distinguishes instances that share one class-level method.
+    key = getattr(backend_init, "__self__", backend_init)
+    with _init_lock:
+        try:
+            if key in _initialized_backends:
+                return
+            _initialized_backends.add(key)
+        except TypeError:
+            # Unhashable or non-weak-referenceable hook: skip dedup, fire anyway.
+            pass
+    backend_init()
+
+
 def get_compiler_fn(
     compiler_fn: str | Callable[..., Any] | None,
 ) -> WrapBackendDebug:
@@ -1631,6 +1666,7 @@ def get_compiler_fn(
     else:
         compiler_str = None
     compiler_fn = lookup_backend(compiler_fn)  # type: ignore[arg-type]
+    _maybe_fire_backend_init(compiler_fn)
     return wrap_backend_debug(compiler_fn, compiler_str)
 
 
@@ -1816,14 +1852,10 @@ def _optimize(
             graph faster.
             One can also provide additional context for the backend, like
             torch.jit.fuser("fuser2"), by setting the backend_ctx_ctor attribute.
-            See AOTAutogradMemoryEfficientFusionWithContext for the usage.
-            Backends can also run eager one-time initialization by defining a
-            ``_dynamo_backend_init`` attribute (a no-arg callable); it is called
-            once the backend is resolved, before backend_ctx_ctor. It is invoked
-            once per ``torch.compile()`` / ``torch._dynamo.optimize()`` call, so
-            a backend reused across multiple compiled functions is initialized
-            once per site and should be idempotent. Backends forced via
-            ``torch.compiler.set_stance(force_backend=...)`` bypass this hook.
+            Backends can also define a ``_dynamo_backend_init`` no-arg callable
+            for one-time eager initialization; it fires once per hook callable
+            when the backend is resolved. See the "Eager Backend Initialization"
+            section of torch.compiler_custom_backends.md.
             - Or, a string backend name in `torch._dynamo.list_backends()`
         nopython: If True, graph breaks will be errors and there will
             be a single whole-program graph.
@@ -1880,12 +1912,6 @@ def _optimize(
         )
 
     backend = get_compiler_fn(backend)
-
-    # Allow backends to perform eager initialization (e.g., load native
-    # libraries, initialize device contexts) before the first invocation.
-    backend_init = getattr(backend, "_dynamo_backend_init", None)
-    if backend_init is not None:
-        backend_init()
 
     # Find if backend has any extra context manager
     backend_ctx_ctor = getattr(backend, "backend_ctx_ctor", null_context)
@@ -2830,12 +2856,6 @@ def _optimize_assert(
     symbolic_convert.error_on_graph_break. Can also be used for testing.
     """
     backend = get_compiler_fn(backend)
-
-    # Allow backends to perform eager initialization (e.g., load native
-    # libraries, initialize device contexts) before the first invocation.
-    backend_init = getattr(backend, "_dynamo_backend_init", None)
-    if backend_init is not None:
-        backend_init()
 
     # Find if backend has any extra context manager
     backend_ctx_ctor = getattr(backend, "backend_ctx_ctor", null_context)

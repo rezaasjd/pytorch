@@ -6,7 +6,11 @@ import unittest
 
 import torch
 import torch.nn.utils.rnn as rnn_utils
-from torch.testing._internal.common_device_type import instantiate_device_type_tests
+from torch.testing._internal.common_device_type import (
+    deviceCountAtLeast,
+    instantiate_device_type_tests,
+    onlyCUDA,
+)
 from torch.testing._internal.common_utils import (
     HardwareClassification,
     run_tests,
@@ -15,13 +19,9 @@ from torch.testing._internal.common_utils import (
 )
 
 
-class _PackedSequenceTestMixIn:
-    """Shared helpers for packed sequence test classes."""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.batch_size = 5
-        self.max_length = 6
+class _PackedSequenceTestMixin:
+    batch_size = 5
+    max_length = 6
 
     def _ordered_sequence(self, tensor_type):
         """Create ordered list of random sequences"""
@@ -44,7 +44,7 @@ class _PackedSequenceTestMixIn:
         return padded_tensor, lengths
 
 
-class PackedSequenceTest(_PackedSequenceTestMixIn, TestCase):
+class PackedSequenceTest(_PackedSequenceTestMixin, TestCase):
     hw_classification = HardwareClassification.GENERIC
 
     _type_by_name = {
@@ -485,12 +485,12 @@ class PackedSequenceTest(_PackedSequenceTestMixIn, TestCase):
                         packed, batch_first=batch_first, total_length=total_length
                     )
 
-            self.assertRaisesRegex(
-                ValueError,
-                r"Expected total_length to be at least the "
-                r"length of the longest sequence in input",
-                err_fn,
-            )
+                self.assertRaisesRegex(
+                    ValueError,
+                    r"Expected total_length to be at least the "
+                    r"length of the longest sequence in input",
+                    err_fn,
+                )
         # test that pad_packed_sequence returns results of correct length
         for batch_first in (True, False):
             no_extra_pad, _ = rnn_utils.pad_packed_sequence(
@@ -518,7 +518,7 @@ class PackedSequenceTest(_PackedSequenceTestMixIn, TestCase):
                 self.assertEqual(unpacked, ref_output)
 
 
-class PackedSequenceTestDevice(_PackedSequenceTestMixIn, TestCase):
+class PackedSequenceTestDevice(_PackedSequenceTestMixin, TestCase):
     hw_classification = HardwareClassification.ACCELERATOR
 
     @unittest.skipIf(
@@ -537,13 +537,57 @@ class PackedSequenceTestDevice(_PackedSequenceTestMixIn, TestCase):
             self.assertIs(a, a.to("cpu", dtype=torch.int32))
             self.assertEqual(a.long(), a.to(torch.int64))
 
-            b = a.to(device)
-            self.assertIs(b, b.to(device))
+            d = torch.device(device)
+            for dev in dict.fromkeys((d.type, str(d))):
+                b = a.to(dev)
+                self.assertIs(b, b.to(dev))
+                self.assertEqual(a, b.to("cpu"))
+                self.assertEqual(b, a.to(dev))
+                self.assertEqual(a, b.to("cpu", dtype=torch.int32))
+                self.assertIs(b, b.to(dtype=torch.int32))
+                self.assertEqual(b.long(), b.to(dtype=torch.int64))
+
+    @deviceCountAtLeast(2)
+    @onlyCUDA
+    @unittest.skipIf(
+        TEST_WITH_TORCHDYNAMO and sys.version_info[:2] < (3, 13),
+        "Frame Handling Difference between Python versions",
+    )
+    def test_to_multi_device(self, devices):
+        for enforce_sorted in (True, False):
+            padded, lengths = self._padded_sequence(torch.IntTensor)
+            a = rnn_utils.pack_padded_sequence(
+                padded, lengths, enforce_sorted=enforce_sorted
+            ).cpu()
+
+            dev = devices[1]
+            b = a.to(dev)
+            self.assertIs(b, b.to(dev))
             self.assertEqual(a, b.to("cpu"))
-            self.assertEqual(b, a.to(device))
+            self.assertEqual(b, a.to(dev))
             self.assertEqual(a, b.to("cpu", dtype=torch.int32))
             self.assertIs(b, b.to(dtype=torch.int32))
             self.assertEqual(b.long(), b.to(dtype=torch.int64))
+
+    @onlyCUDA
+    @unittest.skipIf(
+        TEST_WITH_TORCHDYNAMO and sys.version_info[:2] < (3, 13),
+        "Frame Handling Difference between Python versions",
+    )
+    def test_cuda(self, device):
+        for enforce_sorted in (True, False):
+            padded, lengths = self._padded_sequence(torch.IntTensor)
+            a = rnn_utils.pack_padded_sequence(
+                padded, lengths, enforce_sorted=enforce_sorted
+            ).cpu()
+
+            b = a.cuda()
+            self.assertIs(b, b.cuda())
+            self.assertEqual(a, b.to("cpu"))
+
+            b = a.cuda(device=device)
+            self.assertIs(b, b.cuda())
+            self.assertEqual(a, b.to("cpu"))
 
 
 instantiate_device_type_tests(PackedSequenceTestDevice, globals())

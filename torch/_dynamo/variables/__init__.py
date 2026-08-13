@@ -120,7 +120,9 @@ from .iter import (
 )
 from .lazy import LazyConstantVariable, LazyVariableTracker
 from .lists import (
+    BaseListIteratorVariable,
     BaseListVariable,
+    DequeIteratorVariable,
     DequeVariable,
     ListIteratorVariable,
     ListVariable,
@@ -217,6 +219,7 @@ __all__ = [
     "AutogradFunctionVariable",
     "BackwardHookVariable",
     "BaseBuiltinVariable",
+    "BaseListIteratorVariable",
     "BaseListVariable",
     "CallMethodVariable",
     "BuiltinVariable",

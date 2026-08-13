@@ -440,6 +440,37 @@ class TestIterators(torch._dynamo.test_case.TestCase):
         with self.assertRaises(Unsupported):
             cv.tp_iter_impl(None)
 
+    def test_deque_iterator_not_a_list_iterator(self):
+        """deque iterators must not subclass ListIteratorVariable (CPython parity).
+
+        In CPython, _deque_iterator is not a subclass of list_iterator; the VTs
+        should mirror that. Both still share BaseListIteratorVariable so the
+        common iterator logic (and isinstance-based dispatch) keeps working.
+        """
+        from torch._dynamo.variables.lists import (
+            BaseListIteratorVariable,
+            DequeIteratorVariable,
+            DequeReverseIteratorVariable,
+            ListIteratorVariable,
+        )
+
+        self.assertFalse(issubclass(DequeIteratorVariable, ListIteratorVariable))
+        self.assertTrue(issubclass(DequeIteratorVariable, BaseListIteratorVariable))
+        self.assertTrue(issubclass(ListIteratorVariable, BaseListIteratorVariable))
+        self.assertTrue(
+            issubclass(DequeReverseIteratorVariable, BaseListIteratorVariable)
+        )
+
+    @make_dynamo_test
+    def test_yield_from_deque_iterator(self):
+        """yield from over a deque iterator still traces after the VT split."""
+        import collections
+
+        def gen():
+            yield from iter(collections.deque([1, 2, 3]))
+
+        self.assertEqual(list(gen()), [1, 2, 3])
+
     @make_dynamo_test
     def test_comprehensions_with_iterator(self):
         """Test different comprehension types with iterators"""

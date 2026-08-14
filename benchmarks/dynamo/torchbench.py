@@ -22,6 +22,7 @@ except ImportError:
 
 from torch._dynamo.testing import collect_results, reduce_to_scalar_loss
 from torch._dynamo.utils import clone_inputs
+from torch.utils._triton import has_triton_block_ptr
 
 
 # We are primarily interested in tf32 datatype
@@ -124,7 +125,12 @@ class TorchBenchmarkRunner(BenchmarkRunner):
 
     @property
     def skip_models_for_cuda(self):
-        return self._skip["device"]["cuda"]
+        models = self._skip["device"]["cuda"]
+        if not has_triton_block_ptr():
+            # The external sam_fast package still uses tl.make_block_ptr.
+            # Remove this gate once that package migrates to tensor descriptors.
+            return models | {"sam_fast"}
+        return models
 
     @property
     def skip_models_for_xpu(self):

@@ -27,9 +27,6 @@ if has_triton():
     GLOBAL_SCALE = 2
     GLOBAL_SCALE_CONSTEXPR: tl.constexpr = tl.constexpr(GLOBAL_SCALE)
 
-    def init_to_zero(name):
-        return lambda nargs: nargs[name].zero_()
-
     @triton.jit
     def subtract_kernel_inner(
         x_ptr, y_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr
@@ -63,17 +60,16 @@ if has_triton():
         output = x + y
         tl.atomic_add(output_ptr + offsets, output, mask=mask)
 
+    # Keep this fixture on the supported autotune path. User-defined pre/post
+    # hooks are rejected by the Triton HOP and tested separately.
     @triton.autotune(
         configs=[
             triton.Config(
                 {"BLOCK_SIZE": 1024},
                 num_warps=4,
                 num_stages=2,
-                pre_hook=init_to_zero("output_ptr"),
             )
         ],
-        pre_hook=init_to_zero("output_ptr"),
-        post_hook=init_to_zero("output_ptr"),
         key=["n_elements"],
     )
     @triton.jit
@@ -89,7 +85,7 @@ if has_triton():
         x = tl.load(x_ptr + offsets, mask=mask)
         y = tl.load(y_ptr + offsets, mask=mask)
         output = x + y
-        tl.atomic_add(output_ptr + offsets, output, mask=mask)
+        tl.store(output_ptr + offsets, output, mask=mask)
 
     autotuned_subtract = triton.autotune(
         configs=[

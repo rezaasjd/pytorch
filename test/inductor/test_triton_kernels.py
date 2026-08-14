@@ -49,8 +49,8 @@ from torch.testing._internal.inductor_utils import (
     HAS_CUDA_AND_TRITON,
     HAS_GPU,
     HAS_XPU_AND_TRITON,
-    TRITON_HAS_CPU,
     requires_block_ptr,
+    TRITON_HAS_CPU,
 )
 from torch.testing._internal.logging_utils import log_settings, logs_to_string
 

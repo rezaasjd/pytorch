@@ -598,7 +598,8 @@ class NestedReduction:
 
     # MXFP6 is the largest interleaved packing form currently exercised.
     MAX_INTERLEAVED_SUB_PARENT_FACTOR = 4
-    MAX_SUB_PARENT_FACTOR = MAX_INTERLEAVED_SUB_PARENT_FACTOR
+    # Factors through 16 bound split code size and are covered by kernel-form tests.
+    MAX_SUB_PARENT_FACTOR = 16
 
     class GroupedAxis(enum.Enum):
         R = enum.auto()
@@ -608,6 +609,9 @@ class NestedReduction:
         # The parent grouped axis is split as child, lane, so parent_r =
         # factor * child_r + lane. This covers NVFP4 even/odd packing.
         INTERLEAVED = enum.auto()
+        # The parent grouped axis is split as lane, child, so parent_r =
+        # lane * child_extent + child_r. This covers chunk/split consumers.
+        CONTIGUOUS = enum.auto()
 
     @dataclasses.dataclass(frozen=True)
     class PointwiseDomainContext:
@@ -715,6 +719,7 @@ class NestedReduction:
             parent_rnumel,
             parent_source_names,
             sub_parent_factor,
+            allow_contiguous=True,
         )
         if not source_layouts:
             return None
@@ -845,6 +850,10 @@ class NestedReduction:
                 ):
                     return None
                 continue
+            if cls._pointwise_node_matches_domain(node, numel, (numel,)):
+                continue
+            if cls._pointwise_node_matches_domain(node, full_numel, (numel, rnumel)):
+                continue
             rate = cls._sub_parent_epilogue_rate(
                 node_numel,
                 full_numel,
@@ -860,10 +869,6 @@ class NestedReduction:
                 ):
                     candidates.append((node, node_factor, output_lanes))
                     continue
-            if cls._pointwise_node_matches_domain(node, numel, (numel,)):
-                continue
-            if cls._pointwise_node_matches_domain(node, full_numel, (numel, rnumel)):
-                continue
             return None
         if not candidates:
             return None
@@ -1022,6 +1027,24 @@ class NestedReduction:
             sympy.Mod(sympy_subs(index, extent_subs), factor)
         )
 
+    @staticmethod
+    def sub_parent_contiguous_lane(
+        index: sympy.Expr,
+        factor: int,
+        parent_extent: sympy.Expr,
+    ) -> sympy.Expr:
+        """Select a contiguous lane from an index's constant offset."""
+        child_extent = FloorDiv(parent_extent, factor)
+        index_vars = {
+            symbol: 0
+            for symbol in index.free_symbols
+            if not symbol_is_type(symbol, SymT.SIZE)
+        }
+        offset = sympy_subs(index, index_vars)
+        return V.graph.sizevars.simplify(
+            FloorDiv(sympy.Mod(offset, parent_extent), child_extent)
+        )
+
     @classmethod
     def _try_get_sub_parent_source_layouts(
         cls,
@@ -1032,13 +1055,14 @@ class NestedReduction:
         parent_source_names: OrderedSet[str],
         sub_parent_factor: int,
         *,
+        allow_contiguous: bool,
         known_extent_subs: dict[sympy.Expr, sympy.Expr] | None = None,
     ) -> tuple[tuple[str, NestedReduction.SubParentSourceLayout], ...] | None:
         """Find parent inputs reused by supported lane-resolution projections.
 
         Independent epilogue inputs remain ordinary derived-domain loads. Shared
         parent inputs must have one normalized parent access, and every epilogue
-        access must equal it under ``parent_r = factor * child_r + lane``.
+        access must match its interleaved or contiguous lane projection.
         ``known_extent_subs`` carries divisibility already proved by a surrounding
         nested-reduction topology.
         """
@@ -1051,6 +1075,12 @@ class NestedReduction:
         )
         if extent_subs is None:
             return None
+        contiguous_parent_rnumel = V.graph.sizevars.simplify(parent_rnumel)
+        can_match_contiguous = (
+            allow_contiguous
+            and isinstance(contiguous_parent_rnumel, (int, sympy.Integer))
+            and is_power_of_2(int(contiguous_parent_rnumel))
+        )
 
         # Normalize source accesses into a common two-axis domain.
         def normalized_source_indices(
@@ -1125,7 +1155,8 @@ class NestedReduction:
             if source_parent_indices is None or len(source_parent_indices) != 1:
                 return None
             parent_index = sympy_subs(next(iter(source_parent_indices)), extent_subs)
-            for child_index in source_child_indices:
+
+            def matches_interleaved(child_index: sympy.Expr) -> bool:
                 lane = cls.interleaved_sub_parent_lane(
                     child_index,
                     sub_parent_factor,
@@ -1136,13 +1167,36 @@ class NestedReduction:
                     V.graph.sizevars.statically_known_equals(lane, value)
                     for value in range(sub_parent_factor)
                 ):
-                    return None
+                    return False
                 expected = parent_index.subs(
                     parent_r, sub_parent_factor * child_r + lane
                 )
-                if not V.graph.sizevars.statically_known_equals(child_index, expected):
-                    return None
-            source_layouts.append((name, cls.SubParentSourceLayout.INTERLEAVED))
+                return V.graph.sizevars.statically_known_equals(child_index, expected)
+
+            if sub_parent_factor <= cls.MAX_INTERLEAVED_SUB_PARENT_FACTOR and all(
+                matches_interleaved(index) for index in source_child_indices
+            ):
+                source_layouts.append((name, cls.SubParentSourceLayout.INTERLEAVED))
+                continue
+
+            def matches_contiguous(child_index: sympy.Expr) -> bool:
+                lane = cls.sub_parent_contiguous_lane(
+                    child_index, sub_parent_factor, contiguous_parent_rnumel
+                )
+                if not any(
+                    V.graph.sizevars.statically_known_equals(lane, value)
+                    for value in range(sub_parent_factor)
+                ):
+                    return False
+                expected = parent_index.subs(parent_r, child_r + lane * child_rnumel)
+                return V.graph.sizevars.statically_known_equals(child_index, expected)
+
+            if can_match_contiguous and all(
+                matches_contiguous(index) for index in source_child_indices
+            ):
+                source_layouts.append((name, cls.SubParentSourceLayout.CONTIGUOUS))
+                continue
+            return None
         return tuple(source_layouts)
 
     @staticmethod
@@ -1471,6 +1525,7 @@ class NestedReduction:
             parent_rnumel,
             parent_source_names,
             sub_parent_factor,
+            allow_contiguous=False,
             known_extent_subs=(
                 {parent_rnumel: normalized_parent_rnumel}
                 if parent_rnumel != normalized_parent_rnumel

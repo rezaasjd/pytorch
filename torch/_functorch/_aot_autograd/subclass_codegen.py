@@ -543,8 +543,12 @@ def _codegen_subclass_wrapper_source(
     # --- Call compiled function ---
     state.emit("unwrapped_outs = compiled_fn(unwrapped_args)")
 
-    # Opaque constants are stored as FakeScriptObject in the compiled graph;
-    # unwrap them back to real objects (no-op for tensors and SymInts).
+    # Opaque constants appear as FakeScriptObject at runtime; unwrap to real
+    # objects.  Safe for non-opaque elements (no-op for tensors/SymInts) and
+    # for OpaqueMeta slots in the passthrough case: create_subclass_metadata
+    # (subclass_utils.py:179-185) restricts those to symbolic opaques, and
+    # runtime_unwrap_tensor_subclasses (subclass_utils.py:444-446) appends
+    # the real inner_value on the input side.
     if has_opaque_outputs:
         unwrap_fn = state.add_global(
             state.fresh_name("_unwrap_fake_obj"),

@@ -8,7 +8,7 @@ from typing import Any
 
 import torch
 import torch._functorch.config
-from torch._functorch._aot_autograd.schemas import PlainTensorMeta
+from torch._functorch._aot_autograd.schemas import OpaqueMeta, PlainTensorMeta
 from torch._functorch._aot_autograd.subclass_codegen import (
     _codegen_subclass_wrapper_source,
 )
@@ -32,6 +32,10 @@ class _TestSubclassMeta:
     original_subclass_type: type
     outer_size_from_attr: str | None = None
     outer_stride_from_attr: str | None = None
+
+
+class _TensorWithOpaque(torch.Tensor):
+    """Synthetic subclass for golden tests involving OpaqueMeta attrs."""
 
 
 class TestSubclassCodegen(TestCase):
@@ -240,6 +244,82 @@ def inner_fn(args):
     _out_idx += 1
     assert _out_idx == _num_wrapped_outs, f'wrapped {_out_idx} outputs, expected {_num_wrapped_outs}'
     return (_out_plain_4,)""",
+        )
+
+    def test_has_opaque_outputs_emits_unwrap(self):
+        """has_opaque_outputs=True emits the FakeScriptObject unwrap pass."""
+        source, _ = _codegen_subclass_wrapper_source(
+            inp_metas=[PlainTensorMeta(unwrapped_idx=0)],
+            out_metas=[PlainTensorMeta(unwrapped_idx=0)],
+            num_fw_outs_saved_for_bw=None,
+            has_opaque_outputs=True,
+        )
+
+        self.assertExpectedInline(
+            source,
+            """\
+def inner_fn(args):
+    unwrapped_args = []
+    unwrapped_args.append(args[0])
+    unwrapped_args.extend(args[1:])
+    args.clear()
+    unwrapped_outs = compiled_fn(unwrapped_args)
+    unwrapped_outs = [_unwrap_fake_obj_0(o) for o in unwrapped_outs]
+    _out_idx = 0
+    _num_wrapped_outs = len(unwrapped_outs)
+    assert _num_wrapped_outs == 1, f'expected 1 wrapped outputs, got {_num_wrapped_outs}'
+    _out_plain_1 = unwrapped_outs[_out_idx]
+    _out_idx += 1
+    assert _out_idx == _num_wrapped_outs, f'wrapped {_out_idx} outputs, expected {_num_wrapped_outs}'
+    return (_out_plain_1,)""",
+        )
+
+    def test_has_opaque_outputs_with_opaque_meta(self):
+        """has_opaque_outputs=True with OpaqueMeta in subclass attrs."""
+        out_meta = _TestSubclassMeta(
+            flat_tensor_start_idx=0,
+            arg_count=2,
+            included_subclass_symints=True,
+            attrs={
+                "a": PlainTensorMeta(unwrapped_idx=0),
+                "_counter": OpaqueMeta(),
+            },
+            outer_size=(4,),
+            outer_stride=(1,),
+            meta=None,
+            original_subclass=None,
+            original_subclass_type=_TensorWithOpaque,
+            outer_size_from_attr="a",
+        )
+
+        source, _ = _codegen_subclass_wrapper_source(
+            inp_metas=[PlainTensorMeta(unwrapped_idx=0)],
+            out_metas=[out_meta],
+            num_fw_outs_saved_for_bw=None,
+            has_opaque_outputs=True,
+        )
+
+        self.assertExpectedInline(
+            source,
+            """\
+def inner_fn(args):
+    unwrapped_args = []
+    unwrapped_args.append(args[0])
+    unwrapped_args.extend(args[1:])
+    args.clear()
+    unwrapped_outs = compiled_fn(unwrapped_args)
+    unwrapped_outs = [_unwrap_fake_obj_0(o) for o in unwrapped_outs]
+    _out_idx = 0
+    _num_wrapped_outs = len(unwrapped_outs)
+    assert _num_wrapped_outs == 2, f'expected 2 wrapped outputs, got {_num_wrapped_outs}'
+    _out_attr_2 = unwrapped_outs[_out_idx]
+    _out_idx += 1
+    _out_attr_3 = unwrapped_outs[_out_idx]
+    _out_idx += 1
+    _out_inner_1 = {'a': _out_attr_2, '_counter': _out_attr_3}
+    _out_6 = _subclass_type_4.__tensor_unflatten__(_out_inner_1, _meta_5, _out_attr_2.size(), (1,))
+    assert _out_idx == _num_wrapped_outs, f'wrapped {_out_idx} outputs, expected {_num_wrapped_outs}'
+    return (_out_6,)""",
         )
 
     def test_trailing_args_forwarded(self):

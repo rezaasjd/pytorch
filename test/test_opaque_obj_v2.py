@@ -367,6 +367,31 @@ register_custom_class(Color, typ="symbolic")
 register_custom_class(ColorWithDescriptor, typ="symbolic")
 
 
+# Constant-type opaque with a strict __eq__ (uses `type(other) is StrictEqValueConfig`, not
+# isinstance).  This makes assertEqual assertions discriminating: they fail
+# for FakeScriptObject even though isinstance(fake, Cfg) passes via
+# CustomClassBaseMeta.__instancecheck__.  Can't reuse ValueConfig for this
+# reason (its __eq__ uses isinstance which passes for fakes).
+class StrictEqValueConfig:
+    def __init__(self, scale):
+        self.scale = scale
+
+    def __eq__(self, other):
+        return type(other) is StrictEqValueConfig and other.scale == self.scale
+
+    def __hash__(self):
+        return hash(self.scale)
+
+    def __fx_repr__(self):
+        return (
+            f"StrictEqValueConfig({self.scale!r})",
+            {"StrictEqValueConfig": StrictEqValueConfig},
+        )
+
+
+register_custom_class(StrictEqValueConfig, typ="constant")
+
+
 # A tensor subclass (similar to TwoTensor) that also holds an opaque Counter
 # object
 class TensorWithCounter(torch.Tensor):
@@ -2338,21 +2363,6 @@ class GraphModule(torch.nn.Module):
         failures on subsequent recompiles.
         """
 
-        class Cfg:
-            def __init__(self, scale):
-                self.scale = scale
-
-            def __eq__(self, other):
-                return type(other) is Cfg and other.scale == self.scale
-
-            def __hash__(self):
-                return hash(self.scale)
-
-            def __fx_repr__(self):
-                return (f"Cfg({self.scale!r})", {"Cfg": Cfg})
-
-        register_custom_class(Cfg, typ="constant")
-
         class WrapperSub(torch.Tensor):
             @staticmethod
             def __new__(cls, data, cfg):
@@ -2402,7 +2412,7 @@ class GraphModule(torch.nn.Module):
                 # and store it on the module. This makes it a top-level graph
                 # output alongside the subclass return value.
                 if not self.cfgs:
-                    self.cfgs.append(Cfg(0.5))
+                    self.cfgs.append(StrictEqValueConfig(0.5))
                 out = x @ self.w
                 return WrapperSub(out, self.cfgs[0])
 
@@ -2416,16 +2426,55 @@ class GraphModule(torch.nn.Module):
         # a FakeScriptObject.  Use exact type check because CustomClassBaseMeta
         # __instancecheck__ makes isinstance(fake, Cfg) pass for fakes.
         self.assertEqual(len(m.cfgs), 1)
-        self.assertIs(type(m.cfgs[0]), Cfg)
+        self.assertIs(type(m.cfgs[0]), StrictEqValueConfig)
         self.assertEqual(m.cfgs[0].scale, 0.5)
 
         # The subclass output must also be correct
         self.assertIsInstance(result, WrapperSub)
+        self.assertEqual(result._cfg, StrictEqValueConfig(0.5))
 
         # Grad-mode change triggers a recompile; without the fix the corrupted
         # opaque causes a guard failure (AssertionError: Unexpected type FakeScriptObject)
         result2 = c(torch.randn(4, 8, requires_grad=True))
         self.assertIsInstance(result2, WrapperSub)
+
+    def test_opaque_constant_output_with_opaque_meta_subclass(self):
+        """When has_opaque_outputs=True, the unwrap pass must be safe for
+        OpaqueMeta slots within a subclass (passthrough from input)."""
+
+        # TensorWithCounter has Counter (a symbolic opaque) in its inner_keys.
+        # The function also produces a constant-type opaque output, triggering
+        # has_opaque_outputs=True.  The Counter in the subclass's OpaqueMeta
+        # slots must survive the blanket unwrap unchanged.
+        class Mod(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.cfgs = []
+
+            def forward(self, x):
+                if not self.cfgs:
+                    self.cfgs.append(StrictEqValueConfig(0.5))
+                return x * 2
+
+        a = torch.randn(4, 4)
+        b = torch.randn(4, 4)
+        counter = Counter(start=5, end=10)
+        size = SizeStore(4)
+        x = TensorWithCounter(a, b, counter, size)
+
+        m = Mod()
+        c = torch.compile(m, fullgraph=True, backend="aot_eager")
+
+        with torch.no_grad():
+            out = c(x)
+
+        # The subclass output must preserve its opaque attr
+        self.assertIsInstance(out, TensorWithCounter)
+        self.assertIs(out._counter, counter)
+
+        # The constant opaque output must be the real object
+        self.assertEqual(len(m.cfgs), 1)
+        self.assertIs(type(m.cfgs[0]), StrictEqValueConfig)
 
     @unittest.skipIf(IS_FBCODE or IS_SANDCASTLE, "Skip in fbcode/sandcastle")
     def test_opaque_constant_output_with_subclass_output_cache_hit(self):
@@ -2435,8 +2484,16 @@ class GraphModule(torch.nn.Module):
         verify a true cross-process cache hit.  The original repro pattern:
         module mutations storing both an opaque constant and a subclass, with
         a plain tensor return, under no_grad.  Without the fix in
-        CompiledFxGraphConstants.unwrap(), the cache hit returns None because
-        torchbind_constants were not included in the attrs set on the loaded module.
+        CompiledFxGraphConstantsWithGm.unwrap(), the cache hit returns None
+        because torchbind_constants were not included in the attrs set on the
+        loaded module.
+
+        Note: this exercises CompiledFxGraphConstantsWithGm.unwrap() (the
+        FxGraph cache / Inductor path via compile_fx.py).  The base
+        CompiledFxGraphConstants.unwrap() (AOTAutograd cache path) has the
+        same fix but is unreachable here -- the subclass constructor in the
+        graph triggers BypassAOTAutogradCache at autograd_cache.py:244-248
+        ("Unsupported call_function target").
         """
         script = textwrap.dedent(
             """
@@ -2525,15 +2582,15 @@ class GraphModule(torch.nn.Module):
                         return line
                 self.fail(f"No RESULT line in subprocess output:\n{out}")
 
-            # Run 1: populate cache
+            # Run 1: populate cache (cold compile)
             line1 = run_and_parse()
-            self.assertIn("miss=1", line1)
             self.assertIn("cfg_type=Q", line1)
+            self.assertIn("hit=0 ", line1)
 
-            # Run 2: cache hit in a fresh process
+            # Run 2: cache hit in a fresh process, opaque must survive
             line2 = run_and_parse()
-            self.assertIn("hit=1", line2)
             self.assertIn("cfg_type=Q", line2)
+            self.assertIn("hit=1 ", line2)
 
     def test_tangent_primal_proxy_collision_for_opaque_inner_attr(self):
         """Regression test for tangent/primal proxy collision.

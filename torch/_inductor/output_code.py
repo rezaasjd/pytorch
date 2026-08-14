@@ -85,9 +85,11 @@ if TYPE_CHECKING:
     # Value type for the constants dict passed through unwrap() and consumed by
     # PyCodeCache.load_by_key_path / cudagraph post-compile.  Includes bare
     # `type` because opaque_value_type_classes maps names to subclass type objects
-    # needed for isinstance checks in generated code.
+    # needed for isinstance checks in generated code.  CustomClassBase covers
+    # constant-type opaque instances stored in torchbind_constants (runtime-only
+    # relationship via CustomClassBaseMeta.__instancecheck__, not static subclass).
     _ConstantValue: TypeAlias = (
-        torch.Tensor | torch._C.ScriptObject | FakeScriptObject | type
+        torch.Tensor | torch._C.ScriptObject | FakeScriptObject | CustomClassBase | type
     )
 
     class CompiledFnRunner(Protocol):
@@ -284,7 +286,8 @@ def cudagraph_post_compile(
         current_callable = compiled_graph.current_callable
         if current_callable is None:
             raise AssertionError("current_callable must not be None")
-        # Filter to only tensor constants (exclude opaque value type classes)
+        # Filter to only tensor constants (exclude torchbind constants and
+        # opaque value type classes)
         tensor_constants = {
             k: v for k, v in constants.items() if isinstance(v, torch.Tensor)
         }
@@ -382,7 +385,8 @@ def cudagraph_partition_post_compile(
     mutated_input_idxs = compiled_graph.mutated_input_idxs
     device_index = next(iter(compiled_graph.device_idxs))
 
-    # Filter to only tensor constants (exclude opaque value type classes)
+    # Filter to only tensor constants (exclude torchbind constants and
+    # opaque value type classes)
     tensor_constants = {
         k: v for k, v in constants.items() if isinstance(v, torch.Tensor)
     }
@@ -496,6 +500,9 @@ class CompiledFxGraphConstants:
     def unwrap(self, g: CompiledFxGraph) -> dict[str, _ConstantValue]:
         if g.constants is None:
             raise AssertionError("g.constants must not be None")
+        # Note: on a cache hit, torchbind_constants are pickle round-trip copies,
+        # not the user's original objects.  Mutations or identity checks against
+        # the original won't reflect here.
         return {
             **g.constants,
             **g.torchbind_constants,

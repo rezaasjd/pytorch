@@ -37,6 +37,7 @@ from torch._guards import (
     tracing,
     TracingContext,
 )
+from torch._library.fake_class_registry import FakeScriptObject
 from torch._library.opaque_object import is_custom_class
 from torch._library.utils import is_builtin
 from torch._logging import getArtifactLogger
@@ -1454,8 +1455,27 @@ class AOTDispatchSubclassWrapper(CompilerWrapper):
 
         from .subclass_codegen import codegen_subclass_wrapper
 
-        has_opaque_outputs = any(
-            is_custom_class(info.raw_type) for info in runtime_metadata.output_info
+        # Opaque constants appear as FakeScriptObject in the compiled graph's
+        # output at runtime.  Scan two sources:
+        # - output_info: constant-type opaques (raw_type = real class, caught
+        #   by is_custom_class) and symbolic opaques passed through from inputs
+        #   (raw_type = FakeScriptObject).  Mutated inputs and intermediate
+        #   bases cannot be opaques, so output_info covers all of flat_f_outs.
+        # - num_opaque_objects_saved_for_bw: opaques in the trailing activation
+        #   region (saved for backward), disjoint from output_info.  Opaques
+        #   are fakeified by frontend_utils.py:105-108 during AOT tracing, so
+        #   they may be FakeScriptObject in the compiled graph output.  In
+        #   observed cases these are symbolic passthrough from subclass inputs
+        #   (real at runtime), but the clause covers the general case.
+        # Note: is_custom_class also fires for enum outputs (Enum is registered
+        # at opaque_object.py); the unwrap is a no-op for those.
+        has_opaque_outputs = (
+            any(
+                is_custom_class(info.raw_type)
+                or issubclass(info.raw_type, FakeScriptObject)
+                for info in runtime_metadata.output_info
+            )
+            or (runtime_metadata.num_opaque_objects_saved_for_bw or 0) > 0
         )
         inner_fn = codegen_subclass_wrapper(
             compiled_fn=compiled_fn,

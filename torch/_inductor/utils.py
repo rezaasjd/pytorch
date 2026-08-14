@@ -104,27 +104,26 @@ if TYPE_CHECKING:
     from .scheduler import BaseSchedulerNode, SchedulerBuffer
 
 
-# GPU_TYPES is a static list retained for backward compatibility.
-# It will NOT include PrivateUse1 backends even after they declare
-# is_gpu()=True.  For membership tests use the is_gpu() predicate; for
-# enumeration use _gpu_types() or get_gpu_type().  Several call-sites
-# still iterate GPU_TYPES (grep for "GPU_TYPES") and will silently
-# exclude PrivateUse1 backends until migrated to is_gpu() / _gpu_types().
-GPU_TYPES = ["cuda", "mps", "xpu", "mtia"]
-T = TypeVar("T")
-
-
+# GPU_TYPES is derived from the device interface registry so that a backend
+# advertising BackendFeature.GPU is included automatically. Late-binding
+# (module __getattr__) so backends registered after import are picked up.
 def _gpu_types() -> list[str]:
-    """Private: walk the registered DeviceInterface registry and return
-    device-type names for which is_gpu() returns True.  Used only by
-    get_gpu_type() and the GPU_TYPES compatibility shim."""
-    from torch._dynamo.device_interface import get_registered_device_interfaces
+    from torch._dynamo.device_interface import BackendFeature, get_registered_device_interfaces
 
     return [
-        d
-        for d, iface in get_registered_device_interfaces()
-        if ":" not in d and iface.is_gpu()
-    ]  # filter "cuda:0"-style indexed entries
+        name
+        for name, iface in get_registered_device_interfaces()
+        if ":" not in name and BackendFeature.GPU in iface.backend_features(None)
+    ]
+
+
+def __getattr__(name: str) -> Any:
+    if name == "GPU_TYPES":
+        return _gpu_types()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+T = TypeVar("T")
 
 
 from torch._dynamo.device_interface import get_interface_for_device
@@ -1948,8 +1947,7 @@ def use_triton_template(
     enable_float8: bool = False,
     check_max_autotune: bool = True,
 ) -> bool:
-    from torch._dynamo.device_interface import BackendFeature
-    from .codegen.common import has_backend_feature
+    from .codegen.common import BackendFeature, has_backend_feature
 
     layout_dtypes = [torch.float16, torch.bfloat16, torch.float32]
     if enable_int32:
@@ -3467,12 +3465,7 @@ def get_cloned_parameter_buffer_name(name: str) -> str:
 
 
 def is_gpu(device: str | None) -> bool:
-    if device is None:
-        return False
-    try:
-        return get_interface_for_device(device).is_gpu()
-    except NotImplementedError:
-        return False
+    return device in _gpu_types()
 
 
 def is_rocm() -> bool:

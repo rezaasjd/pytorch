@@ -9,6 +9,7 @@ import torch.nn.utils.rnn as rnn_utils
 from torch.testing._internal.common_device_type import (
     deviceCountAtLeast,
     instantiate_device_type_tests,
+    onlyAccelerator,
     onlyCUDA,
 )
 from torch.testing._internal.common_utils import (
@@ -42,6 +43,15 @@ class _PackedSequenceTestMixin:
         lengths = [len(i) for i in ordered]
         padded_tensor = rnn_utils.pad_sequence(ordered)
         return padded_tensor, lengths
+
+    def _assert_to_round_trip(self, a, dev):
+        b = a.to(dev)
+        self.assertIs(b, b.to(dev))
+        self.assertEqual(a, b.to("cpu"))
+        self.assertEqual(b, a.to(dev))
+        self.assertEqual(a, b.to("cpu", dtype=torch.int32))
+        self.assertIs(b, b.to(dtype=torch.int32))
+        self.assertEqual(b.long(), b.to(dtype=torch.int64))
 
 
 class PackedSequenceTest(_PackedSequenceTestMixin, TestCase):
@@ -539,16 +549,10 @@ class PackedSequenceTestDevice(_PackedSequenceTestMixin, TestCase):
 
             d = torch.device(device)
             for dev in dict.fromkeys((d.type, str(d))):
-                b = a.to(dev)
-                self.assertIs(b, b.to(dev))
-                self.assertEqual(a, b.to("cpu"))
-                self.assertEqual(b, a.to(dev))
-                self.assertEqual(a, b.to("cpu", dtype=torch.int32))
-                self.assertIs(b, b.to(dtype=torch.int32))
-                self.assertEqual(b.long(), b.to(dtype=torch.int64))
+                self._assert_to_round_trip(a, dev)
 
     @deviceCountAtLeast(2)
-    @onlyCUDA
+    @onlyAccelerator
     @unittest.skipIf(
         TEST_WITH_TORCHDYNAMO and sys.version_info[:2] < (3, 13),
         "Frame Handling Difference between Python versions",
@@ -560,14 +564,7 @@ class PackedSequenceTestDevice(_PackedSequenceTestMixin, TestCase):
                 padded, lengths, enforce_sorted=enforce_sorted
             ).cpu()
 
-            dev = devices[1]
-            b = a.to(dev)
-            self.assertIs(b, b.to(dev))
-            self.assertEqual(a, b.to("cpu"))
-            self.assertEqual(b, a.to(dev))
-            self.assertEqual(a, b.to("cpu", dtype=torch.int32))
-            self.assertIs(b, b.to(dtype=torch.int32))
-            self.assertEqual(b.long(), b.to(dtype=torch.int64))
+            self._assert_to_round_trip(a, devices[1])
 
     @onlyCUDA
     @unittest.skipIf(
@@ -586,6 +583,23 @@ class PackedSequenceTestDevice(_PackedSequenceTestMixin, TestCase):
             self.assertEqual(a, b.to("cpu"))
 
             b = a.cuda(device=device)
+            self.assertIs(b, b.cuda())
+            self.assertEqual(a, b.to("cpu"))
+
+    @deviceCountAtLeast(2)
+    @onlyCUDA
+    @unittest.skipIf(
+        TEST_WITH_TORCHDYNAMO and sys.version_info[:2] < (3, 13),
+        "Frame Handling Difference between Python versions",
+    )
+    def test_cuda_multi_device(self, devices):
+        for enforce_sorted in (True, False):
+            padded, lengths = self._padded_sequence(torch.IntTensor)
+            a = rnn_utils.pack_padded_sequence(
+                padded, lengths, enforce_sorted=enforce_sorted
+            ).cpu()
+
+            b = a.cuda(device=devices[1])
             self.assertIs(b, b.cuda())
             self.assertEqual(a, b.to("cpu"))
 

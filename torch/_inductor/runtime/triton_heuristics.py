@@ -1380,8 +1380,21 @@ class CachingAutotuner(KernelInterface):
         if not ASTSource:
             raise RuntimeError("Installed triton version too old, please upgrade")
 
+        # Gluon kernels need Gluon's ASTSource for its extended IR builder.
+        ast_source_class = ASTSource
+        try:
+            from triton.experimental.gluon._runtime import (
+                GluonASTSource,
+                GluonJITFunction,
+            )
+        except ImportError:
+            pass
+        else:
+            if isinstance(self.fn, GluonJITFunction):
+                ast_source_class = GluonASTSource
+
         compile_args = (
-            ASTSource(
+            ast_source_class(
                 self.fn,
                 compile_meta["signature"],
                 compile_meta["constants"],

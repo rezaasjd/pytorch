@@ -723,6 +723,12 @@ class CompilePackage:
 
         self._current_entry: _DynamoCodeCacheEntry | None = None
         self._installed_globals: dict[types.ModuleType, list[str]] = {}
+        # Code objects holding this package's region state, so uninstall() can
+        # clear all of them -- and only them. Clearing the code object wholesale
+        # would take every OTHER region's entries with it, and since lookup() is
+        # region-exact those owners can no longer be served by what is left.
+        self._installed_precompile_codes: list[types.CodeType] = []
+        self._installed_precompile_region_id = -1
         # device_type that model compiled with.
         self._device_type = "cpu"
 
@@ -733,7 +739,6 @@ class CompilePackage:
         self._initialized = False
         if fn is not None:
             self.initialize(fn, dynamo, ignore_inlined_sources)
-            self.uninstall()
             self.validate()
 
     def is_initialized(self) -> bool:
@@ -957,7 +962,7 @@ class CompilePackage:
         self._installed_globals.setdefault(module, []).append(name)
 
     def uninstall(self) -> None:
-        from torch._C._dynamo.eval_frame import _reset_precompile_entries
+        from torch._C._dynamo.eval_frame import _reset_precompile_entries_for_region
 
         if self._innermost_fn is None:
             raise AssertionError("_innermost_fn is not set in uninstall")
@@ -967,21 +972,35 @@ class CompilePackage:
 
         self._installed_globals = {}
 
-        _reset_precompile_entries(self._innermost_fn.__code__)
+        for code in self._installed_precompile_codes:
+            _reset_precompile_entries_for_region(
+                code, self._installed_precompile_region_id
+            )
+        self._installed_precompile_codes = []
+        self._installed_precompile_region_id = -1
 
-    def install(self, backends: dict[_BackendId, Any]) -> None:
+    def install(
+        self,
+        backends: dict[_BackendId, Any],
+        *,
+        isolate_recompiles_id: int = -1,
+    ) -> None:
         """
         Sync the package states to the compiled function. This includes the following actions:
           1. Clean up the previously installed states.
           2. Install the compiled functions to global scopes.
           3. Install the precompiled cache entries to ExtraStates on the code object.
         """
-        from torch._C._dynamo.eval_frame import _load_precompile_entry
+        from torch._C._dynamo.eval_frame import (
+            _load_precompile_entry,
+            _reset_precompile_entries_for_region,
+        )
 
         from .convert_frame import input_codes
         from .output_graph import get_builtins_dict
 
         self.uninstall()
+        self._installed_precompile_region_id = isolate_recompiles_id
         for code, entry in self._codes.items():
             context = (
                 _compile_frame_context(code)
@@ -1029,6 +1048,11 @@ class CompilePackage:
                     continue
 
                 input_codes.add(target_code)
+                if target_code not in self._installed_precompile_codes:
+                    _reset_precompile_entries_for_region(
+                        target_code, self._installed_precompile_region_id
+                    )
+                    self._installed_precompile_codes.append(target_code)
                 for backend_id in entry.backend_ids:
                     if backend_id not in backends:
                         raise RuntimeError(
@@ -1087,6 +1111,7 @@ class CompilePackage:
                         target_code,
                         guard_manager,
                         SerializedCode.to_code_object(guarded_code.dynamo_code),
+                        isolate_recompiles_id,
                     )
 
     def cache_entry(self) -> _DynamoCacheEntry:
@@ -1373,16 +1398,25 @@ class DiskDynamoCache(DiskDynamoStore):
         counters["dynamo_cache"]["dynamo_cache_miss"] += 1
         return None
 
-    def load_and_install_package(self, fn: Callable[..., Any]) -> CompilePackage | None:
+    def load_and_install_package(
+        self, fn: Callable[..., Any], isolate_recompiles_id: int
+    ) -> CompilePackage | None:
         """
-        Load directly into a package and install backends
+        Load directly into a package and install backends.
+
+        ``isolate_recompiles_id`` must be the region the caller will look up in:
+        precompile entries match their own region only, so installing into the
+        default bucket for an isolated caller loads the artifact and then serves
+        nothing from it.
         """
         results = self.load(fn)
         if results is None:
             return None
         else:
             package = CompilePackage(fn, results.dynamo)
-            package.install(results.backends)
+            package.install(
+                results.backends, isolate_recompiles_id=isolate_recompiles_id
+            )
             return package
 
     def path_prefix(self) -> str:

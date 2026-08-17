@@ -40,8 +40,8 @@ from torch.testing._internal.common_utils import (
 )
 from torch.testing._internal.common_device_type import (
     expectedFailureMeta, instantiate_device_type_tests, deviceCountAtLeast,
-    onlyCPU, largeTensorTest, precisionOverride, dtypes,
-    onlyCUDA, skipCPUIf, dtypesIfCUDA, dtypesIfCPU, skipMeta, onlyAccelerator)
+    largeTensorTest, precisionOverride, dtypes, onlyCPU, onlyCUDA,
+    skipCPUIf, dtypesIfCUDA, dtypesIfCPU, skipMeta, onlyAccelerator)
 from torch.testing._internal.common_dtype import (
     all_types_and_complex, all_types_and_complex_and, all_types_and, floating_and_complex_types, complex_types,
     floating_types, floating_and_complex_types_and, integral_types, integral_types_and, get_all_dtypes,
@@ -98,9 +98,9 @@ def _rand_shape(dim, min_size, max_size):
 # See https://pytorch.org/docs/main/torch.html#creation-ops
 
 class TestTensorCreation(TestCase):
+    hw_classification = HardwareClassification.ACCELERATOR
     exact_dtype = True
 
-    @onlyCPU
     @dtypes(torch.float)
     def test_diag_embed(self, device, dtype):
         x = torch.arange(3 * 4, dtype=dtype, device=device).view(3, 4)
@@ -684,7 +684,7 @@ class TestTensorCreation(TestCase):
         self.assertEqual(res1, res2)
         self.assertTrue(res1.is_contiguous(memory_format=torch.channels_last))
 
-    @onlyCUDA
+    @onlyAccelerator
     def test_cat_channels_last_large_inputs(self, device):
         num_tensors = 130
         inputs_cuda = [
@@ -699,7 +699,7 @@ class TestTensorCreation(TestCase):
         self.assertEqual(result.cpu(), expected)
         self.assertTrue(result.is_contiguous(memory_format=torch.channels_last))
 
-    @onlyCUDA
+    @onlyAccelerator
     def test_cat_out_memory_format(self, device):
         inp_size = (4, 4, 4, 4)
         expected_size = (8, 4, 4, 4)
@@ -740,7 +740,7 @@ class TestTensorCreation(TestCase):
 
         self.assertTrue(res3_cuda.is_contiguous(memory_format=torch.channels_last))
 
-    @onlyCUDA
+    @onlyAccelerator
     def test_cat_stack_cross_devices(self, device):
         cuda = torch.randn((3, 3), device=device)
         cpu = torch.randn((3, 3), device='cpu')
@@ -755,7 +755,7 @@ class TestTensorCreation(TestCase):
 
     # TODO: reconcile with other cat tests
     # TODO: Compare with a NumPy reference instead of CPU
-    @onlyCUDA
+    @onlyAccelerator
     def test_cat(self, device):
         SIZE = 10
         for dim in range(-3, 3):
@@ -778,9 +778,8 @@ class TestTensorCreation(TestCase):
         self.assertEqual(z.size(), (21, SIZE, SIZE))
 
     # TODO: update this test to compare against NumPy instead of CPU
-    @onlyCUDA
-    @dtypesIfCUDA(torch.half, torch.float, torch.double)
-    @dtypes(torch.float, torch.double)
+    @onlyAccelerator
+    @dtypes(torch.half, torch.float, torch.double)
     def test_device_rounding(self, device, dtype):
         # test half-to-even
         a = [-5.8, -3.5, -2.3, -1.5, -0.5, 0.5, 1.5, 2.3, 3.5, 5.8]
@@ -1110,7 +1109,6 @@ class TestTensorCreation(TestCase):
                 else:
                     self.assertEqual(from_tensor, to_tensor, exact_dtype=False)
 
-    @onlyCPU
     @dtypes(torch.half, torch.double, torch.int)
     def test_cat2(self, device, dtype):
         SIZE = 10
@@ -1363,37 +1361,37 @@ class TestTensorCreation(TestCase):
         y = x[2:]
         self.assertEqual(int(y), 3)
 
-    def test_meshgrid_empty(self):
+    def test_meshgrid_empty(self, device):
         with self.assertRaisesRegex(RuntimeError,
                                     'expects a non-empty TensorList'):
             torch.meshgrid()
 
-    def test_meshgrid_unsupported_indexing(self):
+    def test_meshgrid_unsupported_indexing(self, device):
         with self.assertRaisesRegex(RuntimeError,
                                     'indexing must be one of "xy" or "ij"'):
-            torch.meshgrid(torch.tensor([1, 2]), indexing='')
+            torch.meshgrid(torch.tensor([1, 2], device=device), indexing='')
 
-    def test_meshgrid_non_1d_tensor(self):
+    def test_meshgrid_non_1d_tensor(self, device):
         with self.assertRaisesRegex(RuntimeError,
                                     'Expected 0D or 1D tensor'):
-            torch.meshgrid(torch.tensor([[1, 2], [3, 4]]))
+            torch.meshgrid(torch.tensor([[1, 2], [3, 4]], device=device))
 
-    def test_meshgrid_inconsistent_dtype(self):
+    def test_meshgrid_inconsistent_dtype(self, device):
         with self.assertRaisesRegex(
                 RuntimeError, 'expects all tensors to have the same dtype'):
-            torch.meshgrid(torch.tensor([1], dtype=torch.int),
-                           torch.tensor([2], dtype=torch.float))
+            torch.meshgrid(torch.tensor([1], dtype=torch.int, device=device),
+                           torch.tensor([2], dtype=torch.float, device=device))
 
-    def test_meshgrid_inconsistent_device(self):
+    def test_meshgrid_inconsistent_device(self, device):
         with self.assertRaisesRegex(
                 RuntimeError, 'expects all tensors to have the same device'):
-            torch.meshgrid(torch.tensor([1], device='cpu'),
+            torch.meshgrid(torch.tensor([1], device=device),
                            torch.tensor([2], device='meta'))
 
-    def test_meshgrid_warns_if_no_indexing(self):
+    def test_meshgrid_warns_if_no_indexing(self, device):
         with self.assertWarnsOnceRegex(
                 UserWarning, '.*will be required to pass the indexing arg.*'):
-            torch.meshgrid(torch.tensor([1, 2]))
+            torch.meshgrid(torch.tensor([1, 2], device=device))
 
     def test_meshgrid_default_indexing(self, device):
         a = torch.tensor(1, device=device)
@@ -2393,7 +2391,7 @@ class TestTensorCreation(TestCase):
             self.assertEqual(t[0], a[0])
             self.assertEqual(t[steps - 1], a[steps - 1])
 
-    @onlyCUDA
+    @onlyAccelerator
     @largeTensorTest('16GB')
     def test_range_factories_64bit_indexing(self, device):
         bigint = 2 ** 31 + 1
@@ -2460,7 +2458,7 @@ class TestTensorCreation(TestCase):
                                                             sparse_size, dtype=torch.float64)
                 self.assertEqual(sparse_with_dtype.device, torch.device('cpu'))
 
-    @onlyCUDA
+    @onlyAccelerator
     def test_new_tensor_device(self, device):
         torch_device = torch.device(device)
         cpu_device = torch.device('cpu')
@@ -2603,27 +2601,6 @@ class TestTensorCreation(TestCase):
         self.assertEqual((0,), torch.kaiser_window(0, device=device).shape)
         self.assertEqual((1, 1, 0), torch.tensor([[[]]], device=device).shape)
         self.assertEqual((1, 1, 0), torch.as_tensor([[[]]], device=device).shape)
-
-    @onlyCUDA
-    def test_tensor_factory_gpu_type_inference(self, device):
-        with set_default_tensor_type(torch.cuda.DoubleTensor):
-            with set_default_dtype(torch.float32):
-                self.assertIs(torch.float32, torch.tensor(0.).dtype)
-                self.assertEqual(torch.device(device), torch.tensor(0.).device)
-            with set_default_dtype(torch.float64):
-                self.assertIs(torch.float64, torch.tensor(0.).dtype)
-                self.assertEqual(torch.device(device), torch.tensor(0.).device)
-
-    @onlyCUDA
-    def test_tensor_factory_gpu_type(self, device):
-        with set_default_tensor_type(torch.cuda.FloatTensor):
-            x = torch.zeros((5, 5))
-            self.assertIs(torch.float32, x.dtype)
-            self.assertTrue(x.is_cuda)
-        with set_default_tensor_type(torch.cuda.DoubleTensor):
-            x = torch.zeros((5, 5))
-            self.assertIs(torch.float64, x.dtype)
-            self.assertTrue(x.is_cuda)
 
     @skipCPUIf(True, 'compares device with cpu')
     @dtypes(torch.int, torch.long, torch.float, torch.double)
@@ -2906,6 +2883,29 @@ class TestTensorCreation(TestCase):
     @dtypes(*all_types_and_complex_and(torch.half, torch.bool, torch.bfloat16))
     def test_refs_tensor(self, device, dtype):
         self.assertEqual(torch._refs.tensor([], device=device, dtype=dtype), torch.tensor([], device=device, dtype=dtype))
+
+
+class TestTensorCreationCudaOnly(TestCase):
+    hw_classification = HardwareClassification.CUDA
+
+    def test_tensor_factory_gpu_type_inference(self, device):
+        with set_default_tensor_type(torch.cuda.DoubleTensor):
+            with set_default_dtype(torch.float32):
+                self.assertIs(torch.float32, torch.tensor(0.).dtype)
+                self.assertEqual(torch.device(device), torch.tensor(0.).device)
+            with set_default_dtype(torch.float64):
+                self.assertIs(torch.float64, torch.tensor(0.).dtype)
+                self.assertEqual(torch.device(device), torch.tensor(0.).device)
+
+    def test_tensor_factory_gpu_type(self, device):
+        with set_default_tensor_type(torch.cuda.FloatTensor):
+            x = torch.zeros((5, 5))
+            self.assertIs(torch.float32, x.dtype)
+            self.assertTrue(x.is_cuda)
+        with set_default_tensor_type(torch.cuda.DoubleTensor):
+            x = torch.zeros((5, 5))
+            self.assertIs(torch.float64, x.dtype)
+            self.assertTrue(x.is_cuda)
 
 
 class TestTensorCreationCpuOnly(TestCase):
@@ -4526,6 +4526,7 @@ class TestAsArray(TestCase):
 
 
 instantiate_device_type_tests(TestTensorCreation, globals())
+instantiate_device_type_tests(TestTensorCreationCudaOnly, globals(), only_for="cuda")
 instantiate_device_type_tests(TestTensorCreationCpuOnly, globals(), only_for="cpu")
 instantiate_device_type_tests(TestRandomTensorCreation, globals())
 instantiate_device_type_tests(TestLikeTensorCreation, globals())

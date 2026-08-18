@@ -100,5 +100,6 @@ HF_LLM_MODELS: dict[str, Benchmark] = {
     "openai/whisper-tiny": WhisperBenchmark,
     "Qwen/Qwen3-0.6B": TextGenerationBenchmark,
     "mistralai/Mistral-7B-Instruct-v0.3": TextGenerationBenchmark,
+    "LiquidAI/LFM2.5-2.6B": TextGenerationBenchmark,
     "openai/gpt-oss-20b": TextGenerationBenchmark,
 }

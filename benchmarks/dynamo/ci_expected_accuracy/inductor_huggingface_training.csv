@@ -123,3 +123,4 @@ meta-llama/Llama-3.2-1B,eager_fail_to_run,0,0,0
 
 
 openai/whisper-tiny,eager_fail_to_run,0,0,0
+LiquidAI/LFM2.5-2.6B,eager_fail_to_run,0,0,0

@@ -3918,6 +3918,13 @@ def parse_args(args=None):
     run_mode_group.add_argument(
         "--inference", action="store_true", help="Performs inference"
     )
+    try:
+        from .torchbench_llm import add_llm_args
+    except ImportError:
+        from torchbench_llm import add_llm_args
+
+    add_llm_args(parser)
+
     parsed = parser.parse_args(args)
     if parsed.batch_invariant and not parsed.accuracy:
         parser.error("--batch-invariant requires --accuracy")
@@ -3972,6 +3979,16 @@ def main(runner, original_dir=None, args=None):
     if original_dir:
         os.chdir(original_dir)
     args = parse_args() if not args else parse_args(args)
+    if getattr(args, "llm_mode", None):
+        # The decomposed LLM harness owns its own generation loop and reporting,
+        # so it bypasses the model-suite runner entirely.
+        try:
+            from .torchbench_llm import run_llm_benchmark
+        except ImportError:
+            from torchbench_llm import run_llm_benchmark
+
+        return run_llm_benchmark(args)
+
     if args.baseline:
         args.baseline = os.path.abspath(args.baseline)
 
